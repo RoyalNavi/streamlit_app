@@ -1,0 +1,15 @@
+[Unit]
+Description=Streamlit app for rafikm.duckdns.org
+After=network.target
+
+[Service]
+Type=simple
+User=rafik
+WorkingDirectory=/home/rafik/Documents/streamlit_app
+Environment=PATH=/home/rafik/Documents/streamlit_app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/rafik/Documents/streamlit_app/.venv/bin/streamlit run /home/rafik/Documents/streamlit_app/app.py --server.headless true --server.port 8508 --server.address 0.0.0.0 --server.enableXsrfProtection false --server.enableCORS false
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

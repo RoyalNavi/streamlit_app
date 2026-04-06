@@ -1,0 +1,41 @@
+lancer streamlit 
+
+installer nginx pour securisation 
+
+configurer nginx
+    creer une fichier streamlit dans /etc/nginx/
+
+    server {
+    listen 80;
+    listen [::]:80;
+
+    server_name http://88.166.66.34:55556/;  # public IP
+
+    location / {
+        proxy_pass http://localhost:8507;  # Port local de Streamlit
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # Authentification basique
+        auth_basic "Accès restreint";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+    }
+    }   
+
+ouvrir un port sur la box 
+http://88.166.66.34:55556/
+redirection vers port donné par streamlit 8507 par exemple
+
+creer un racourci du fichier /sites-availables/streamlit à /sites-enabled/
+sudo ln -s /etc/nginx/sites-available/streamlit /etc/nginx/sites-enabled/
+
+pour config user et pwd, editer ce fichioer : 
+/etc/nginx/.htpasswd
+
+
+
+LACNER L'APP :
+nohup streamlit run app.py --server.port 8507 --server.enableXsrfProtection false --server.enableCORS false > streamlit.log 2>&1 & 
