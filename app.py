@@ -1,7 +1,7 @@
-import json
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from html import escape
 from io import StringIO
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -21,11 +21,10 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 MARKET_CACHE_PATH = DATA_DIR / "market_directory.csv"
 CRYPTO_CACHE_PATH = DATA_DIR / "crypto_directory.csv"
-WATCHLIST_PATH = DATA_DIR / "watchlist.json"
 MARKET_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 CRYPTO_CACHE_TTL_SECONDS = 12 * 60 * 60
 USER_AGENT = "rafik-streamlit-app/1.0 (finance dashboard)"
-MAX_COMPARISON_COUNT = 8
+MAX_COMPARISON_COUNT = 10
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
@@ -33,6 +32,7 @@ COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 MAJOR_INDICES = [
     {"ticker": "^GSPC", "name": "S&P 500", "exchange": "Index", "asset_type": "Indice"},
     {"ticker": "^IXIC", "name": "Nasdaq Composite", "exchange": "Index", "asset_type": "Indice"},
+    {"ticker": "URTH", "name": "MSCI World", "exchange": "ETF proxy", "asset_type": "Indice"},
     {"ticker": "^DJI", "name": "Dow Jones Industrial Average", "exchange": "Index", "asset_type": "Indice"},
     {"ticker": "^RUT", "name": "Russell 2000", "exchange": "Index", "asset_type": "Indice"},
     {"ticker": "^VIX", "name": "CBOE Volatility Index", "exchange": "Index", "asset_type": "Indice"},
@@ -56,7 +56,7 @@ PERIOD_OPTIONS = {
     "Maximum": {"period": "max", "interval": "1mo"},
 }
 
-DEFAULT_TICKERS = ["AAPL", "MSFT", "^FCHI", "BTC-USD"]
+DEFAULT_TICKERS = ["^FCHI", "^GDAXI", "^GSPC", "URTH", "^IXIC"]
 OTHER_EXCHANGE_NAMES = {
     "A": "NYSE American",
     "N": "NYSE",
@@ -64,7 +64,6 @@ OTHER_EXCHANGE_NAMES = {
     "Z": "Cboe BZX",
     "V": "IEX",
 }
-DEFAULT_WATCHLIST_TICKERS = ["AAPL", "MSFT", "^FCHI", "BTC-USD", "ETH-USD"]
 GENERAL_NEWS_FEEDS = {
     "A la une": [
         {"label": "Franceinfo - Les titres", "url": "https://www.francetvinfo.fr/titres.rss"},
@@ -85,7 +84,7 @@ GENERAL_NEWS_FEEDS = {
 }
 
 
-st.set_page_config(page_title="Comparateur Boursier", layout="wide")
+st.set_page_config(page_title="Rafik Moulouel", layout="wide")
 
 
 def ensure_data_dir() -> None:
@@ -196,28 +195,6 @@ def download_company_directory(force_refresh: bool = False) -> Path:
         raise
 
 
-def load_saved_watchlist() -> list[str]:
-    ensure_data_dir()
-    if not WATCHLIST_PATH.exists():
-        return DEFAULT_WATCHLIST_TICKERS.copy()
-    try:
-        payload = json.loads(WATCHLIST_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return DEFAULT_WATCHLIST_TICKERS.copy()
-
-    tickers = payload.get("tickers", [])
-    if not isinstance(tickers, list):
-        return DEFAULT_WATCHLIST_TICKERS.copy()
-    cleaned = [str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()]
-    return cleaned or DEFAULT_WATCHLIST_TICKERS.copy()
-
-
-def save_watchlist(tickers: list[str]) -> None:
-    ensure_data_dir()
-    payload = {"tickers": tickers, "updated_at": int(time.time())}
-    WATCHLIST_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
 @st.cache_data(show_spinner=False)
 def load_symbol_catalog(cache_marker: float) -> pd.DataFrame:
     _ = cache_marker
@@ -242,8 +219,37 @@ def load_symbol_catalog(cache_marker: float) -> pd.DataFrame:
     return catalog.sort_values(["asset_type", "name"], ascending=[True, True]).reset_index(drop=True)
 
 
+def extract_history_series(
+    raw: pd.DataFrame,
+    tickers: tuple[str, ...],
+    preferred_field: str,
+    fallback_field: str = "Close",
+) -> pd.DataFrame:
+    series_map: dict[str, pd.Series] = {}
+    for ticker in tickers:
+        if isinstance(raw.columns, pd.MultiIndex):
+            if ticker not in raw.columns.get_level_values(0):
+                continue
+            frame = raw[ticker]
+        else:
+            frame = raw
+
+        field = preferred_field if preferred_field in frame else fallback_field
+        if field not in frame:
+            continue
+
+        series = frame[field].dropna()
+        if not series.empty:
+            series_map[ticker] = series
+
+    history = pd.DataFrame(series_map).sort_index()
+    if history.empty:
+        raise ValueError("Impossible de construire un historique de prix exploitable.")
+    return history
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def download_price_history(tickers: tuple[str, ...], period: str, interval: str) -> pd.DataFrame:
+def download_price_histories(tickers: tuple[str, ...], period: str, interval: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     if yf is None:
         raise RuntimeError("yfinance n'est pas disponible.")
 
@@ -260,26 +266,9 @@ def download_price_history(tickers: tuple[str, ...], period: str, interval: str)
     if raw.empty:
         raise ValueError("Aucune donnee de marche n'a ete renvoyee.")
 
-    closes: dict[str, pd.Series] = {}
-    for ticker in tickers:
-        if len(tickers) == 1:
-            frame = raw
-        else:
-            if ticker not in raw.columns.get_level_values(0):
-                continue
-            frame = raw[ticker]
-
-        if "Close" not in frame:
-            continue
-
-        series = frame["Close"].dropna()
-        if not series.empty:
-            closes[ticker] = series
-
-    history = pd.DataFrame(closes).sort_index()
-    if history.empty:
-        raise ValueError("Impossible de construire un historique de cloture.")
-    return history
+    close_history = extract_history_series(raw, tickers, preferred_field="Close")
+    return_history = extract_history_series(raw, tickers, preferred_field="Adj Close", fallback_field="Close")
+    return close_history, return_history
 
 
 def compute_performance_frame(history: pd.DataFrame) -> pd.DataFrame:
@@ -295,6 +284,15 @@ def compute_performance_frame(history: pd.DataFrame) -> pd.DataFrame:
     return performance
 
 
+def build_display_history(history: pd.DataFrame, smooth_closures: bool) -> pd.DataFrame:
+    if not smooth_closures:
+        return history
+
+    # For visual comparison only, carry the last available quote forward so
+    # market closures do not produce broken lines when assets have different calendars.
+    return history.sort_index().ffill()
+
+
 def format_chart_index(index: pd.Index) -> list[str]:
     if not isinstance(index, pd.DatetimeIndex):
         return [str(value) for value in index]
@@ -308,33 +306,156 @@ def format_chart_index(index: pd.Index) -> list[str]:
     return [value.strftime("%d/%m/%Y") for value in index]
 
 
-def build_watchlist_table(catalog: pd.DataFrame, history: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    catalog_by_ticker = catalog.set_index("ticker")
-    for ticker in history.columns:
-        series = history[ticker].dropna()
-        if series.empty:
-            continue
-        first_value = float(series.iloc[0])
-        last_value = float(series.iloc[-1])
-        previous_value = float(series.iloc[-2]) if len(series) > 1 else last_value
-        day_change = ((last_value / previous_value) - 1) * 100 if previous_value else 0.0
-        period_change = ((last_value / first_value) - 1) * 100 if first_value else 0.0
-        row = catalog_by_ticker.loc[ticker]
-        rows.append(
-            {
-                "Nom": row["name"],
-                "Ticker": ticker,
-                "Type": row["asset_type"],
-                "Marche": row["exchange"] or "-",
-                "Dernier cours": round(last_value, 2),
-                "Variation seance (%)": round(day_change, 2),
-                "Variation periode (%)": round(period_change, 2),
-            }
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_movers(limit: int = 5) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if yf is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    query = yf.EquityQuery(
+        "and",
+        [
+            yf.EquityQuery("eq", ["region", "us"]),
+            yf.EquityQuery("is-in", ["exchange", "NMS", "NYQ", "ASE"]),
+            yf.EquityQuery("gte", ["intradaymarketcap", 20_000_000_000]),
+            yf.EquityQuery("gte", ["intradayprice", 5]),
+            yf.EquityQuery("gt", ["dayvolume", 100_000]),
+        ],
+    )
+
+    def run_screen(sort_ascending: bool) -> pd.DataFrame:
+        try:
+            payload = yf.screen(query, size=60, sortField="percentchange", sortAsc=sort_ascending)
+        except Exception:
+            return pd.DataFrame()
+        quotes = payload.get("quotes", [])
+        rows = []
+        for quote in quotes:
+            rows.append(
+                {
+                    "Ticker": str(quote.get("symbol") or "").upper(),
+                    "Dernier cours": quote.get("regularMarketPrice"),
+                    "Variation seance (%)": quote.get("regularMarketChangePercent"),
+                    "Volume": quote.get("regularMarketVolume"),
+                    "Marche": quote.get("fullExchangeName") or "-",
+                }
+            )
+        return pd.DataFrame(rows)
+
+    gainers = run_screen(sort_ascending=False)
+    losers = run_screen(sort_ascending=True)
+    return gainers.head(limit), losers.head(limit)
+
+
+def render_market_movers_section(catalog: pd.DataFrame) -> None:
+    st.subheader("A la une")
+    st.caption("Un coup d'oeil rapide sur les grandes capitalisations des gros indices US, pas sur les petites valeurs speculatives.")
+
+    with st.spinner("Je charge les plus fortes variations du jour..."):
+        try:
+            gainers, losers = fetch_market_movers(limit=50)
+        except Exception as exc:  # pragma: no cover - depends on network/provider
+            st.info(f"Impossible de charger les variations du jour : {exc}")
+            return
+
+    companies = catalog[catalog["asset_type"] == "Entreprise"][["ticker", "name", "exchange"]].drop_duplicates(subset=["ticker"])
+    excluded_name_pattern = r"Warrant|Rights?|Units?|Preferred|Depositary|Trust Preferred"
+    companies = companies[~companies["name"].astype(str).str.contains(excluded_name_pattern, case=False, na=False)]
+    companies = companies.rename(columns={"ticker": "Ticker", "name": "Nom", "exchange": "Marche catalogue"})
+
+    def prepare(frame: pd.DataFrame, ascending: bool) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        merged = frame.merge(companies, on="Ticker", how="inner")
+        if merged.empty:
+            return merged
+        merged["Dernier cours"] = pd.to_numeric(merged["Dernier cours"], errors="coerce").round(2)
+        merged["Variation seance (%)"] = pd.to_numeric(merged["Variation seance (%)"], errors="coerce").round(2)
+        merged["Volume"] = pd.to_numeric(merged["Volume"], errors="coerce")
+        merged = merged.dropna(subset=["Variation seance (%)", "Dernier cours"])
+        merged = merged.sort_values("Variation seance (%)", ascending=ascending)
+        return merged[["Nom", "Ticker", "Marche", "Dernier cours", "Variation seance (%)", "Volume"]].head(5)
+
+    gainers_table = prepare(gainers, ascending=False)
+    losers_table = prepare(losers, ascending=True)
+
+    if gainers_table.empty and losers_table.empty:
+        st.info("Aucune variation exploitable pour le moment.")
+        return
+
+    def format_volume(value: float) -> str:
+        if pd.isna(value):
+            return "-"
+        value = float(value)
+        if value >= 1_000_000_000:
+            return f"{value / 1_000_000_000:.1f}B"
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}K"
+        return f"{int(value)}"
+
+    def render_card(title: str, frame: pd.DataFrame, accent: str, background: str) -> None:
+        if frame.empty:
+            st.info("Aucune variation exploitable pour le moment.")
+            return
+
+        rows_markup = []
+        for _, row in frame.head(5).iterrows():
+            rows_markup.append(
+                f"""
+                <div style="
+                    padding:12px 0;
+                    border-top:1px solid rgba(148, 163, 184, 0.18);
+                ">
+                    <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;">
+                        <div>
+                            <div style="font-size:1rem;font-weight:800;color:#0f172a;">
+                                {escape(str(row["Nom"]))}
+                            </div>
+                            <div style="margin-top:2px;font-size:0.88rem;color:#475569;">
+                                {escape(str(row["Ticker"]))} · {escape(str(row["Marche"]))}
+                            </div>
+                            <div style="margin-top:6px;font-size:0.85rem;color:#64748b;">
+                                Cours : {float(row["Dernier cours"]):.2f} · Volume : {format_volume(row["Volume"])}
+                            </div>
+                        </div>
+                        <div style="font-size:1.15rem;font-weight:900;color:{accent};white-space:nowrap;">
+                            {float(row["Variation seance (%)"]):+.2f}%
+                        </div>
+                    </div>
+                </div>
+                """
+            )
+
+        st.html(
+            f"""
+            <div style="
+                background:{background};
+                border:1px solid {accent};
+                border-radius:18px;
+                padding:18px 20px;
+                box-shadow:0 10px 24px rgba(15, 23, 42, 0.08);
+                min-height:420px;
+            ">
+                <div style="font-size:0.88rem;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;color:{accent};">
+                    {escape(title)}
+                </div>
+                <div style="margin-top:10px;font-size:0.96rem;color:#334155;">
+                    Les cinq plus gros mouvements du jour.
+                </div>
+                <div style="margin-top:14px;">
+                    {''.join(rows_markup)}
+                </div>
+            </div>
+            """
         )
-    if not rows:
-        return pd.DataFrame(columns=["Nom", "Ticker", "Type", "Marche", "Dernier cours", "Variation seance (%)", "Variation periode (%)"])
-    return pd.DataFrame(rows).sort_values("Variation periode (%)", ascending=False).reset_index(drop=True)
+
+    gainers_col, losers_col = st.columns(2)
+    with gainers_col:
+        render_card("Ca monte fort", gainers_table, "#15803d", "#f0fdf4")
+
+    with losers_col:
+        render_card("Ca baisse fort", losers_table, "#b91c1c", "#fef2f2")
 
 
 def format_news_datetime(value: str | None) -> str:
@@ -503,6 +624,7 @@ def build_price_figure(
                 x=x_values,
                 y=history[ticker],
                 mode="lines",
+                connectgaps=True,
                 name=label_by_ticker.get(ticker, ticker),
                 hovertemplate="Date : %{x}<br>Prix : %{y:.2f}<extra></extra>",
             )
@@ -535,6 +657,7 @@ def build_performance_figure(
                 x=x_values,
                 y=performance[ticker],
                 mode="lines",
+                connectgaps=True,
                 name=label_by_ticker.get(ticker, ticker),
                 hovertemplate="Date : %{x}<br>Performance : %{y:.2f}%<extra></extra>",
             )
@@ -555,20 +678,139 @@ def build_performance_figure(
     return fig
 
 
+def compute_period_change(series: pd.Series, lookback_points: int) -> float | None:
+    cleaned = series.dropna()
+    if len(cleaned) <= lookback_points:
+        return None
+    end_value = float(cleaned.iloc[-1])
+    start_value = float(cleaned.iloc[-lookback_points - 1])
+    if start_value == 0:
+        return None
+    return (end_value / start_value - 1) * 100
+
+
+def infer_market_sentiment(day_change: float | None, month_change: float | None, news_items: list[dict]) -> tuple[str, str]:
+    score = 0
+    reasons: list[str] = []
+
+    if day_change is not None:
+        if day_change >= 2:
+            score += 1
+            reasons.append("bonne seance")
+        elif day_change <= -2:
+            score -= 1
+            reasons.append("seance faible")
+
+    if month_change is not None:
+        if month_change >= 8:
+            score += 2
+            reasons.append("tendance 1 mois solide")
+        elif month_change >= 3:
+            score += 1
+            reasons.append("tendance 1 mois positive")
+        elif month_change <= -8:
+            score -= 2
+            reasons.append("tendance 1 mois degradee")
+        elif month_change <= -3:
+            score -= 1
+            reasons.append("tendance 1 mois negative")
+
+    positive_words = ("beat", "surge", "growth", "record", "expands", "deal", "rises", "upgrade")
+    negative_words = ("miss", "cuts", "probe", "delay", "falls", "drop", "lawsuit", "warning")
+    for item in news_items[:5]:
+        title = (item.get("title") or "").lower()
+        if any(word in title for word in positive_words):
+            score += 1
+        if any(word in title for word in negative_words):
+            score -= 1
+
+    if score >= 3:
+        return "Positif", ", ".join(reasons[:3]) or "momentum et news plutot favorables"
+    if score <= -3:
+        return "Negatif", ", ".join(reasons[:3]) or "momentum et news plutot defavorables"
+    return "Mitige", ", ".join(reasons[:3]) or "signaux partages"
+
+
+def format_money(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    value = float(value)
+    if abs(value) >= 1_000_000_000_000:
+        return f"${value / 1_000_000_000_000:.2f}T"
+    if abs(value) >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.1f}B"
+    if abs(value) >= 1_000_000:
+        return f"${value / 1_000_000:.1f}M"
+    return f"${value:,.0f}".replace(",", " ")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_company_snapshot(ticker: str) -> dict:
+    if yf is None:
+        raise RuntimeError("yfinance n'est pas disponible.")
+
+    stock = yf.Ticker(ticker)
+    info = stock.get_info()
+
+    revenue = info.get("totalRevenue")
+    if revenue is None:
+        try:
+            income_stmt = stock.income_stmt
+            if not income_stmt.empty and "Total Revenue" in income_stmt.index:
+                revenue = float(income_stmt.loc["Total Revenue"].dropna().iloc[0])
+        except Exception:
+            revenue = None
+
+    price_history, return_history = download_price_histories((ticker,), period="3mo", interval="1d")
+    price_series = price_history[ticker].dropna()
+    return_series = return_history[ticker].dropna()
+
+    day_change = compute_period_change(return_series, 1) if len(return_series) > 1 else None
+    month_change = compute_period_change(return_series, 21)
+    news_items = fetch_news_for_tickers((ticker,), per_ticker_limit=6)
+    sentiment_label, sentiment_reason = infer_market_sentiment(day_change, month_change, news_items)
+
+    summary = str(info.get("longBusinessSummary") or "").strip()
+    if summary:
+        summary = summary.split(". ")[0].strip()
+        if not summary.endswith("."):
+            summary += "."
+
+    return {
+        "name": info.get("longName") or info.get("shortName") or ticker,
+        "ticker": ticker,
+        "revenue": revenue,
+        "sector": info.get("sector") or "-",
+        "industry": info.get("industry") or "-",
+        "summary": summary or "Resume indisponible.",
+        "market_cap": info.get("marketCap"),
+        "day_change": day_change,
+        "month_change": month_change,
+        "last_price": float(price_series.iloc[-1]) if not price_series.empty else None,
+        "sentiment_label": sentiment_label,
+        "sentiment_reason": sentiment_reason,
+        "news_items": news_items[:3],
+    }
+
+
 def build_summary_table(
     catalog: pd.DataFrame,
-    history: pd.DataFrame,
+    price_history: pd.DataFrame,
+    return_history: pd.DataFrame,
 ) -> pd.DataFrame:
     rows = []
     catalog_by_ticker = catalog.set_index("ticker")
-    for ticker in history.columns:
-        series = history[ticker].dropna()
-        if series.empty:
+    for ticker in price_history.columns:
+        price_series = price_history[ticker].dropna()
+        if price_series.empty:
             continue
 
-        start_price = float(series.iloc[0])
-        end_price = float(series.iloc[-1])
-        performance = ((end_price / start_price) - 1) * 100 if start_price else 0.0
+        return_series = return_history[ticker].dropna() if ticker in return_history.columns else price_series
+        start_price = float(price_series.iloc[0])
+        end_price = float(price_series.iloc[-1])
+        base_return = float(return_series.iloc[0]) if not return_series.empty else 0.0
+        end_return = float(return_series.iloc[-1]) if not return_series.empty else 0.0
+        performance = ((end_return / base_return) - 1) * 100 if base_return else 0.0
         row = catalog_by_ticker.loc[ticker]
         rows.append(
             {
@@ -600,72 +842,102 @@ def render_header(catalog: pd.DataFrame, cache_path: Path) -> None:
     )
 
 
-def render_watchlist_section(catalog: pd.DataFrame, selected_period_label: str) -> list[str]:
-    st.subheader("Ma watchlist")
-    saved_tickers = load_saved_watchlist()
-    available_watchlist = catalog[catalog["ticker"].isin(saved_tickers)]
-    default_labels = available_watchlist["label"].tolist()
+def render_company_profile_section(catalog: pd.DataFrame) -> None:
+    st.subheader("Fiche entreprise")
+    st.caption("Recherche une entreprise cotee pour voir son activite, son chiffre d'affaires et un sentiment de marche indicatif.")
 
-    watchlist_labels = st.multiselect(
-        "Actifs a surveiller",
-        options=catalog["label"].tolist(),
-        default=default_labels,
-        max_selections=20,
-        key="watchlist_labels",
-        placeholder="Ajoute des actions, indices ou cryptos a suivre dans le temps.",
+    companies = catalog[catalog["asset_type"] == "Entreprise"].copy()
+    if companies.empty:
+        st.info("Aucune entreprise n'est disponible dans le catalogue.")
+        return
+
+    companies = companies.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+    label_by_ticker = dict(zip(companies["ticker"], companies["label"]))
+    default_ticker = DEFAULT_TICKERS[0] if DEFAULT_TICKERS[0] in label_by_ticker else str(companies.iloc[0]["ticker"])
+
+    if "company_profile_selected_ticker" not in st.session_state:
+        st.session_state["company_profile_selected_ticker"] = default_ticker
+    if "company_profile_search_version" not in st.session_state:
+        st.session_state["company_profile_search_version"] = 0
+
+    search_widget_key = f"company_profile_search_{st.session_state['company_profile_search_version']}"
+    selected_from_search = st.selectbox(
+        "Chercher une entreprise ou un ticker",
+        options=companies["ticker"].tolist(),
+        index=None,
+        format_func=lambda ticker: label_by_ticker.get(ticker, ticker),
+        key=search_widget_key,
+        placeholder="Exemple: Apple, AAPL, Microsoft, NVDA...",
+        help="La recherche se vide automatiquement apres la selection.",
     )
-
-    watchlist_assets = catalog[catalog["label"].isin(watchlist_labels)].drop_duplicates(subset=["ticker"]).reset_index(drop=True)
-    watchlist_tickers = watchlist_assets["ticker"].tolist()
-
-    save_col, load_col = st.columns(2)
-    if save_col.button("Sauvegarder la watchlist", key="save_watchlist_button"):
-        save_watchlist(watchlist_tickers)
-        st.success("Watchlist sauvegardee.")
-    if load_col.button("Recharger la watchlist sauvegardee", key="reload_watchlist_button"):
+    if selected_from_search is not None:
+        st.session_state["company_profile_selected_ticker"] = selected_from_search
+        st.session_state["company_profile_search_version"] += 1
         st.rerun()
 
-    if not watchlist_tickers:
-        st.info("Ajoute quelques actifs a ta watchlist pour surveiller leurs cours.")
-        return []
+    selected_ticker = st.session_state.get("company_profile_selected_ticker", default_ticker)
 
-    period_config = PERIOD_OPTIONS[selected_period_label]
-    with st.spinner("Je charge les cours de la watchlist..."):
+    selected_company = companies[companies["ticker"] == selected_ticker].iloc[0]
+
+    with st.spinner("Je charge la fiche entreprise..."):
         try:
-            watchlist_history = download_price_history(
-                tickers=tuple(watchlist_tickers),
-                period=period_config["period"],
-                interval=period_config["interval"],
-            )
+            snapshot = fetch_company_snapshot(str(selected_ticker))
         except Exception as exc:  # pragma: no cover - depends on network/provider
-            st.error(f"Impossible de charger la watchlist : {exc}")
-            return watchlist_tickers
+            st.info(f"Impossible de charger cette fiche pour le moment : {exc}")
+            return
 
-    watchlist_table = build_watchlist_table(catalog, watchlist_history)
-    st.dataframe(watchlist_table, width="stretch", hide_index=True)
-    return watchlist_tickers
+    with st.container(border=True):
+        top_col, sentiment_col = st.columns([2, 1])
+        top_col.markdown(f"### {snapshot['name']}")
+        top_col.caption(f"{snapshot['ticker']} | {selected_company['exchange'] or '-'}")
+
+        sentiment_color = {
+            "Positif": "#15803d",
+            "Mitige": "#a16207",
+            "Negatif": "#b91c1c",
+        }.get(snapshot["sentiment_label"], "#334155")
+        sentiment_col.html(
+            f"<div style='padding-top:12px;text-align:right;'><span style='display:inline-block;padding:8px 12px;border-radius:999px;background:{sentiment_color};color:#fff;font-weight:700;'>{escape(snapshot['sentiment_label'])}</span></div>"
+        )
+
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+        metric_col1.metric("CA annuel", format_money(snapshot["revenue"]))
+        metric_col2.metric("Cours", f"{snapshot['last_price']:.2f}" if snapshot["last_price"] is not None else "-")
+        metric_col3.metric("Variation 1 mois", f"{snapshot['month_change']:+.2f}%" if snapshot["month_change"] is not None else "-")
+        metric_col4.metric("Capitalisation", format_money(snapshot["market_cap"]))
+
+        info_col1, info_col2 = st.columns(2)
+        info_col1.write(f"**Secteur** : {snapshot['sector']}")
+        info_col1.write(f"**Activite** : {snapshot['industry']}")
+        info_col2.write(f"**Sentiment marche** : {snapshot['sentiment_label']}")
+        info_col2.caption(snapshot["sentiment_reason"])
+
+        st.write(snapshot["summary"])
+
+        if snapshot["news_items"]:
+            st.caption("Dernieres infos")
+            for item in snapshot["news_items"]:
+                title = item.get("title") or "Sans titre"
+                url = item.get("url")
+                if url:
+                    st.markdown(f"- [{title}]({url})")
+                else:
+                    st.markdown(f"- {title}")
 
 
-def render_news_section(catalog: pd.DataFrame, watchlist_tickers: list[str], comparison_tickers: list[str]) -> None:
+def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str]) -> None:
     market_tab, general_tab = st.tabs(["News marche", "Infos generales"])
 
     with market_tab:
         st.subheader("Actualites marche")
         st.caption("Flux recents par actif depuis Yahoo Finance. Utilise le bouton de rafraichissement pour recharger les news.")
 
-        news_scope = st.radio(
-            "Source des actualites",
-            options=["Watchlist", "Comparateur"],
-            horizontal=True,
-            key="news_scope",
-        )
         if st.button("Rafraichir les actualites marche", key="refresh_news_button"):
             fetch_news_for_tickers.clear()
 
-        source_tickers = watchlist_tickers if news_scope == "Watchlist" else comparison_tickers
-        available_tickers = [ticker for ticker in source_tickers if ticker]
+        available_tickers = [ticker for ticker in comparison_tickers if ticker]
         if not available_tickers:
-            st.info("Ajoute des actifs a la watchlist ou au comparateur pour afficher leurs actualites.")
+            st.info("Ajoute des actifs au comparateur pour afficher leurs actualites.")
         else:
             filter_col, sort_col = st.columns(2)
             ticker_options = ["Tous"] + available_tickers
@@ -784,10 +1056,10 @@ def main() -> None:
             options=list(PERIOD_OPTIONS.keys()),
             index=4,
         )
-        compress_time_axis = st.toggle(
-            "Masquer les trous de fermeture",
+        smooth_closures = st.toggle(
+            "Lisser les fermetures de marche",
             value=True,
-            help="Compacte l'axe du temps pour eviter les cassures visuelles dues aux week-ends et fermetures de marche.",
+            help="Prolonge visuellement la derniere cotation connue pendant les fermetures pour eviter les cassures de courbe.",
         )
         use_log_scale = st.toggle("Echelle logarithmique sur le graphe prix", value=False)
 
@@ -801,9 +1073,12 @@ def main() -> None:
     catalog = load_symbol_catalog(max(cache_path.stat().st_mtime, crypto_cache_path.stat().st_mtime))
     render_header(catalog, cache_path)
     dashboard_tab, news_tab = st.tabs(["Tableau de bord", "Actualites"])
+    comparison_tickers: list[str] = []
 
     with dashboard_tab:
-        saved_watchlist_tickers = render_watchlist_section(catalog, selected_period_label)
+        render_market_movers_section(catalog)
+        st.divider()
+        render_company_profile_section(catalog)
         st.divider()
         st.subheader("Comparateur")
 
@@ -812,7 +1087,7 @@ def main() -> None:
             st.warning("Aucun actif ne correspond au filtre choisi.")
             return
 
-        default_tickers = saved_watchlist_tickers or DEFAULT_TICKERS
+        default_tickers = DEFAULT_TICKERS
         default_labels = visible_catalog[visible_catalog["ticker"].isin(default_tickers)]["label"].tolist()
         selected_labels = st.multiselect(
             "Recherche et comparaison",
@@ -825,7 +1100,6 @@ def main() -> None:
 
         if not selected_labels:
             st.info("Selectionne au moins un actif pour afficher les graphes.")
-            comparison_tickers: list[str] = []
         else:
             selected_assets = visible_catalog[visible_catalog["label"].isin(selected_labels)].copy()
             selected_assets = selected_assets.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
@@ -836,53 +1110,58 @@ def main() -> None:
             period_config = PERIOD_OPTIONS[selected_period_label]
             with st.spinner("Je recupere les historiques de marche..."):
                 try:
-                    history = download_price_history(
+                    price_history, return_history = download_price_histories(
                         tickers=tickers,
                         period=period_config["period"],
                         interval=period_config["interval"],
                     )
                 except Exception as exc:  # pragma: no cover - depends on network/provider
                     st.error(f"Impossible de recuperer les donnees de marche : {exc}")
-                    history = pd.DataFrame()
+                    price_history = pd.DataFrame()
+                    return_history = pd.DataFrame()
 
-            if not history.empty:
-                missing_tickers = [ticker for ticker in tickers if ticker not in history.columns]
+            if not price_history.empty:
+                missing_tickers = [ticker for ticker in tickers if ticker not in price_history.columns]
                 if missing_tickers:
                     st.warning(f"Aucune donnee exploitable pour : {', '.join(missing_tickers)}")
 
+                display_history = build_display_history(price_history, smooth_closures)
+                display_return_history = build_display_history(return_history, smooth_closures)
+                performance = compute_performance_frame(display_return_history)
+
                 if use_log_scale:
-                    price_figure = build_price_figure(history, label_by_ticker, compress_time_axis)
+                    price_figure = build_price_figure(display_history, label_by_ticker, smooth_closures)
                     price_figure.update_yaxes(type="log")
                 else:
-                    price_figure = build_price_figure(history, label_by_ticker, compress_time_axis)
+                    price_figure = build_price_figure(display_history, label_by_ticker, smooth_closures)
 
-                performance = compute_performance_frame(history)
-                summary_table = build_summary_table(selected_assets, history)
+                summary_table = build_summary_table(selected_assets, price_history, return_history)
 
                 st.subheader("Vue d'ensemble")
                 st.dataframe(summary_table, width="stretch", hide_index=True)
 
-                price_tab, performance_tab = st.tabs(["Prix", "Performance (%)"])
-                with price_tab:
-                    st.plotly_chart(price_figure, width="stretch")
+                performance_tab, price_tab = st.tabs(["Performance (%)", "Prix"])
                 with performance_tab:
                     st.plotly_chart(
-                        build_performance_figure(performance, label_by_ticker, compress_time_axis),
+                        build_performance_figure(performance, label_by_ticker, smooth_closures),
                         width="stretch",
                     )
+                with price_tab:
+                    st.plotly_chart(price_figure, width="stretch")
 
                 st.caption(
                     f"Periode chargee : {selected_period_label} | Intervalle Yahoo Finance : {period_config['interval']} | "
                     "Les prix sont affiches dans leur devise de cotation d'origine. "
                     + (
-                        "Les fermetures de marche sont visuellement compactees."
-                        if compress_time_axis
-                        else "L'axe du temps suit le calendrier reel."
+                        "Les graphes sont lisses pendant les fermetures de marche, sans modifier les donnees brutes du tableau."
+                        if smooth_closures
+                        else "Les graphes suivent uniquement les points de cotation reels."
                     )
+                    + " Les performances (%) sont calculees sur une serie ajustee quand elle est disponible."
                 )
 
     with news_tab:
-        render_news_section(catalog, saved_watchlist_tickers, comparison_tickers)
+        render_news_section(catalog, comparison_tickers)
 
 
 if __name__ == "__main__":
