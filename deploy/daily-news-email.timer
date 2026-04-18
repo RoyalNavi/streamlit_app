@@ -1,0 +1,10 @@
+[Unit]
+Description=Run daily news recap email every morning
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+Unit=daily-news-email.service
+
+[Install]
+WantedBy=timers.target

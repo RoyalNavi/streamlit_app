@@ -1,0 +1,12 @@
+[Unit]
+Description=Send daily news recap email
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rafik
+WorkingDirectory=/home/rafik/Documents/streamlit_app
+EnvironmentFile=-/home/rafik/Documents/streamlit_app/.env
+Environment=PATH=/home/rafik/Documents/streamlit_app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/rafik/Documents/streamlit_app/.venv/bin/python /home/rafik/Documents/streamlit_app/app.py send-daily-news-email

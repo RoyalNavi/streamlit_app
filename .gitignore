@@ -18,5 +18,9 @@ data/company_tickers_exchange.json
 data/crypto_directory.csv
 data/market_directory.csv
 data/watchlist.json
+data/briefings/
+data/jwt_secret.key
+data/users.sqlite3
+data/users.sqlite3-*
 
 .DS_Store
