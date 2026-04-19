@@ -4626,6 +4626,14 @@ def render_comparator_section(
     return comparison_tickers
 
 
+def default_comparison_tickers(catalog: pd.DataFrame, asset_types: list[str]) -> list[str]:
+    visible_catalog = catalog[catalog["asset_type"].isin(asset_types)].copy()
+    if visible_catalog.empty:
+        return []
+    defaults = visible_catalog[visible_catalog["ticker"].isin(DEFAULT_TICKERS)]
+    return defaults.drop_duplicates(subset=["ticker"])["ticker"].tolist()
+
+
 def main() -> None:
     current_user = require_authenticated_user()
     render_auth_cookie_sync()
@@ -4669,19 +4677,22 @@ def main() -> None:
 
     catalog = load_symbol_catalog(max(cache_path.stat().st_mtime, crypto_cache_path.stat().st_mtime))
     render_header(catalog, cache_path)
-    tab_names = ["Comparateur", "Portefeuille", "Marche du jour", "Analyse", "Actualites"]
+    page_names = ["Comparateur", "Portefeuille", "Marche du jour", "Analyse", "Actualites"]
     if current_user["role"] == "admin":
-        tab_names.append("Admin utilisateurs")
-    tabs = st.tabs(tab_names)
-    comparator_tab = tabs[0]
-    portfolio_tab = tabs[1]
-    market_today_tab = tabs[2]
-    analysis_tab = tabs[3]
-    news_tab = tabs[4]
-    user_admin_tab = tabs[5] if len(tabs) > 5 else None
-    comparison_tickers: list[str] = []
+        page_names.append("Admin utilisateurs")
+    if st.session_state.get("main_page") not in page_names:
+        st.session_state["main_page"] = page_names[0]
+    selected_page = st.radio(
+        "Page",
+        options=page_names,
+        horizontal=True,
+        key="main_page",
+        label_visibility="collapsed",
+    )
 
-    with comparator_tab:
+    comparison_tickers = st.session_state.get("comparison_tickers") or default_comparison_tickers(catalog, asset_types)
+
+    if selected_page == "Comparateur":
         comparison_tickers = render_comparator_section(
             catalog,
             asset_types,
@@ -4689,26 +4700,26 @@ def main() -> None:
             smooth_closures,
             use_log_scale,
         )
+        st.session_state["comparison_tickers"] = comparison_tickers
 
-    with market_today_tab:
+    elif selected_page == "Marche du jour":
         render_market_today_section(catalog)
 
-    with portfolio_tab:
+    elif selected_page == "Portefeuille":
         render_portfolio_section(catalog, current_user)
 
-    with analysis_tab:
+    elif selected_page == "Analyse":
         render_market_movers_section(catalog)
         st.divider()
         render_midcap_recommendations_section()
         st.divider()
         render_company_profile_section(catalog)
 
-    with news_tab:
+    elif selected_page == "Actualites":
         render_news_section(catalog, comparison_tickers, current_user)
 
-    if user_admin_tab is not None:
-        with user_admin_tab:
-            render_user_management_section(current_user)
+    elif selected_page == "Admin utilisateurs" and current_user["role"] == "admin":
+        render_user_management_section(current_user)
 
 
 def run_daily_news_email_command() -> int:
