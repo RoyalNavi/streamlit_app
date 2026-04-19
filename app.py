@@ -2100,6 +2100,7 @@ def fetch_general_news(category: str) -> list[dict]:
             title = title.strip()
             description = description.strip()
             pub_date = pub_date.strip()
+            image_url = extract_first_image_url(description)
             if not title or not link or link in seen_links:
                 continue
             seen_links.add(link)
@@ -2112,6 +2113,7 @@ def fetch_general_news(category: str) -> list[dict]:
                     "feed_label": feed["label"],
                     "feed_url": feed["url"],
                     "published_at": pub_date,
+                    "image_url": image_url,
                 }
             )
 
@@ -2149,12 +2151,97 @@ def sort_general_news_items(news_items: list[dict], sort_by: str) -> list[dict]:
     return sorted(news_items, key=lambda item: parse_rss_datetime_value(item.get("published_at")), reverse=True)
 
 
+def extract_first_image_url(value: str) -> str:
+    if not value:
+        return ""
+    match = re.search(r"<img[^>]+src=[\"']([^\"']+)[\"']", value, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return unescape(match.group(1)).strip()
+
+
 def clean_summary_text(value: str, max_length: int = 240) -> str:
     text = re.sub(r"<[^>]+>", " ", value or "")
     text = re.sub(r"\s+", " ", unescape(text)).strip()
     if len(text) <= max_length:
         return text
     return text[: max_length - 3].rstrip() + "..."
+
+
+def render_general_news_card(item: dict) -> None:
+    image_url = item.get("image_url") or extract_first_image_url(item.get("summary") or "")
+    title = clean_summary_text(item.get("title") or "Sans titre", max_length=130)
+    summary = clean_summary_text(item.get("summary") or "", max_length=260)
+    source = item.get("source") or "Source inconnue"
+    feed_label = item.get("feed_label") or "Flux inconnu"
+    published = format_rss_datetime(item.get("published_at"))
+    url = item.get("url") or ""
+
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stVerticalBlock"] > div:has(> .news-card) {
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 12px;
+            background: #ffffff;
+        }
+        .news-card-title {
+            font-size: 1.02rem;
+            line-height: 1.28;
+            font-weight: 700;
+            margin: 0 0 6px;
+        }
+        .news-card-meta {
+            color: #64748b;
+            font-size: 0.8rem;
+            margin-bottom: 8px;
+        }
+        .news-card-summary {
+            color: #334155;
+            font-size: 0.92rem;
+            line-height: 1.45;
+            margin: 0;
+        }
+        </style>
+        <div class="news-card"></div>
+        """,
+        unsafe_allow_html=True,
+    )
+    image_col, text_col = st.columns([1, 2.4], vertical_alignment="top")
+    with image_col:
+        if image_url:
+            try:
+                st.image(image_url, width="stretch")
+            except Exception:
+                st.markdown(
+                    """
+                    <div style="display:flex;align-items:center;justify-content:center;min-height:180px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;color:#64748b;font-size:0.92rem;">
+                        Image indisponible
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.markdown(
+                """
+                <div style="display:flex;align-items:center;justify-content:center;min-height:180px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;color:#64748b;font-size:0.92rem;">
+                    Image indisponible
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    with text_col:
+        if url:
+            st.markdown(f"<p class='news-card-title'><a href='{escape(url)}'>{escape(title)}</a></p>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<p class='news-card-title'>{escape(title)}</p>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='news-card-meta'>{escape(source)} | {escape(feed_label)} | {escape(published)}</div>",
+            unsafe_allow_html=True,
+        )
+        if summary:
+            st.markdown(f"<p class='news-card-summary'>{escape(summary)}</p>", unsafe_allow_html=True)
 
 
 def split_email_recipients(value: str) -> list[str]:
@@ -4524,15 +4611,8 @@ def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], cu
         )
 
         for item in general_news[:25]:
-            st.markdown(f"### {item['title']}")
-            st.caption(
-                f"Source : {item['source']} | Flux : {item['feed_label']} | {format_rss_datetime(item['published_at'])}"
-            )
-            if item["summary"]:
-                st.write(item["summary"])
-            st.markdown(f"[Lire l'article]({item['url']})")
-            st.caption(f"Flux consulte : {item['feed_url']}")
-            st.divider()
+            with st.container():
+                render_general_news_card(item)
 
 
 def render_comparator_section(
