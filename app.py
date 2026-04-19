@@ -4714,11 +4714,121 @@ def default_comparison_tickers(catalog: pd.DataFrame, asset_types: list[str]) ->
     return defaults.drop_duplicates(subset=["ticker"])["ticker"].tolist()
 
 
+def display_connection_logs() -> None:
+    """Affiche les logs de connexion historiques."""
+    st.title("📋 Logs de Connexion Historiques")
+    st.caption("Accès public aux logs de connexion et d'authentification")
+    
+    init_user_db()
+    conn = sqlite3.connect(USER_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    
+    try:
+        # Récupérer les logs avec filtres optionnels
+        col1, col2 = st.columns(2)
+        with col1:
+            event_filter = st.selectbox(
+                "Filtrer par type d'événement",
+                options=["Tous"] + list(set(
+                    row[0] for row in conn.execute(
+                        "SELECT DISTINCT event_type FROM auth_audit_log ORDER BY event_type"
+                    ).fetchall()
+                )),
+                key="event_filter"
+            )
+        with col2:
+            days_back = st.slider("Jours passés", 1, 90, 7, key="days_back")
+        
+        # Requête SQL
+        query = "SELECT * FROM auth_audit_log WHERE 1=1"
+        params = []
+        
+        if event_filter != "Tous":
+            query += " AND event_type = ?"
+            params.append(event_filter)
+        
+        if days_back:
+            query += f" AND occurred_at >= datetime('now', '-{days_back} days')"
+        
+        query += " ORDER BY occurred_at DESC LIMIT 1000"
+        
+        logs = conn.execute(query, params).fetchall()
+        
+        if logs:
+            # Afficher sous forme de dataframe
+            logs_data = []
+            for log in logs:
+                logs_data.append({
+                    "Date/Heure": log["occurred_at"],
+                    "Type d'événement": log["event_type"],
+                    "Acteur": log["actor_username"],
+                    "Utilisateur cible": log["target_username"],
+                    "Détails": log["details"],
+                })
+            
+            df = pd.DataFrame(logs_data)
+            st.dataframe(df, use_container_width=True, height=400)
+            
+            # Statistiques
+            st.subheader("📊 Statistiques")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total logs", len(logs))
+            with col2:
+                logins = sum(1 for log in logs if log["event_type"] == "login")
+                st.metric("Connexions", logins)
+            with col3:
+                logouts = sum(1 for log in logs if log["event_type"] == "logout")
+                st.metric("Déconnexions", logouts)
+            with col4:
+                failed_attempts = sum(1 for log in logs if "failed" in (log["event_type"] or "").lower())
+                st.metric("Échecs", failed_attempts)
+        else:
+            st.info("Aucun log disponible pour cette période")
+    finally:
+        conn.close()
+
+
+def check_password() -> bool:
+    """Vérifie le mot de passe simple."""
+    if "password_verified" not in st.session_state:
+        st.session_state.password_verified = False
+    
+    if st.session_state.password_verified:
+        return True
+    
+    st.title("🔐 Accès Protégé")
+    st.write("Veuillez entrer le mot de passe pour accéder à l'application.")
+    
+    with st.form("password_form"):
+        password = st.text_input("Mot de passe", type="password", key="password_input")
+        submitted = st.form_submit_button("Accéder")
+    
+    if submitted:
+        if password == "rafik":
+            st.session_state.password_verified = True
+            st.rerun()
+        else:
+            st.error("❌ Mot de passe incorrect!")
+    
+    return False
+
+
 def main() -> None:
-    current_user = require_authenticated_user()
-    render_auth_cookie_sync()
-    if current_user is None:
+    # Vérifier le mot de passe en premier
+    if not check_password():
         return
+    
+    # Pas d'authentification requise - accès public
+    render_auth_cookie_sync()
+    
+    # Créer un faux utilisateur pour éviter les erreurs
+    current_user = {
+        "username": "rafik",
+        "display_name": "Rafik",
+        "role": "admin",
+        "must_change_password": False
+    }
 
     ready, reason = market_data_is_ready()
     if not ready:
@@ -4726,7 +4836,8 @@ def main() -> None:
         return
 
     with st.sidebar:
-        render_account_sidebar(current_user)
+        st.header("Application")
+        st.caption("Mode public - Accès illimité")
         st.divider()
         st.header("Parametres")
         refresh_catalog = st.button("Rafraichir actions / indices")
@@ -4757,7 +4868,7 @@ def main() -> None:
 
     catalog = load_symbol_catalog(max(cache_path.stat().st_mtime, crypto_cache_path.stat().st_mtime))
     render_header(catalog, cache_path)
-    page_names = ["Comparateur", "Portefeuille", "Marche du jour", "Analyse", "Actualites"]
+    page_names = ["Comparateur", "Portefeuille", "Marche du jour", "Analyse", "Actualites", "📋 Logs de connexion"]
     if current_user["role"] == "admin":
         page_names.append("Admin utilisateurs")
     if st.session_state.get("main_page") not in page_names:
@@ -4797,6 +4908,9 @@ def main() -> None:
 
     elif selected_page == "Actualites":
         render_news_section(catalog, comparison_tickers, current_user)
+
+    elif selected_page == "📋 Logs de connexion":
+        display_connection_logs()
 
     elif selected_page == "Admin utilisateurs" and current_user["role"] == "admin":
         render_user_management_section(current_user)
