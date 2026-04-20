@@ -1960,14 +1960,27 @@ def fetch_stock_news_headlines(ticker: str) -> list[str]:
 
 def analyze_stocks_with_ai(rows: list[dict], api_key: str) -> dict:
     import json as _json
+
+    def _text_value(value) -> str:
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value if item)
+        if value is None:
+            return "-"
+        return str(value) or "-"
+
     lines = []
     for r in rows:
         headlines = fetch_stock_news_headlines(r["Ticker"])
         actu = " | ".join(h for h in headlines if h) or "Aucune actu disponible"
+        signals = _text_value(r.get("Signaux") or r.get("why_selected") or r.get("Pourquoi"))
+        risks = _text_value(r.get("risk_flags") or r.get("Risques"))
+        setup = _text_value(r.get("Setup_Type") or r.get("Setup"))
+        stability = _text_value(r.get("Stability_Score") or r.get("Stabilite"))
         lines.append(
             f"{r['Ticker']} ({r['Nom']}) — Cap: {r['Capitalisation']} — "
             f"Variation: {r['Variation (%)']:+.1f}% — Score tech: {r['Score']}/10 — "
-            f"Signaux: {r['Signaux']}\n  Actu: {actu}"
+            f"Setup: {setup} — Stabilite: {stability} — "
+            f"Signaux: {signals} — Risques: {risks}\n  Actu: {actu}"
         )
 
     prompt = (
@@ -1998,6 +2011,8 @@ def render_midcap_recommendations_section() -> None:
 
     # ---- Lecture du cache worker ----
     cached = read_cache("stock_ideas")
+    cached_meta = read_cache("stock_ideas_meta")
+    meta = cached_meta.get("data", {}) if cached_meta else {}
     using_cache = cached is not None and cached.get("data")
 
     if using_cache:
@@ -2005,7 +2020,9 @@ def render_midcap_recommendations_section() -> None:
         if age < 35:
             st.caption(
                 f"🟢 Worker actif — analyse mise a jour {cache_freshness_label('stock_ideas')} "
-                f"· univers equilibre Small/Mid/Large · RSI · MACD · Setup MA20 · RS vs SPY · Earnings"
+                f"· univers journalier {meta.get('universe_date', '-')} "
+                f"({meta.get('universe_size', '?')} tickers) · "
+                f"{meta.get('confirmed_count', 0)} signal(s) confirme(s)"
             )
         elif age < 90:
             st.warning(f"🟡 Derniere analyse il y a {int(age)} min — le worker semble lent ou redemarrage en cours.")
@@ -2040,20 +2057,41 @@ def render_midcap_recommendations_section() -> None:
         "Mid (2-10B)": (2e9, 10e9),
         "Large (>10B)": (10e9, float("inf")),
     }
-    filter_col, _ = st.columns([2, 4])
+    filter_col, setup_col, confirm_col = st.columns([2, 2, 2])
     cap_filter = filter_col.selectbox("Segment", options=list(cap_limits.keys()), index=0, key="stock_ideas_cap_filter")
+    setup_filter = setup_col.selectbox(
+        "Setup",
+        options=["Tous", "breakout", "trend", "pullback"],
+        index=0,
+        key="stock_ideas_setup_filter",
+    )
+    confirmed_only = confirm_col.toggle("Signaux confirmes", value=False, key="stock_ideas_confirmed_only")
     cap_min, cap_max = cap_limits[cap_filter]
     rows = [r for r in all_rows if cap_min <= r.get("cap_raw", r.get("_market_cap_raw", 0)) < cap_max]
+    if setup_filter != "Tous":
+        rows = [r for r in rows if r.get("Setup_Type") == setup_filter]
+    if confirmed_only:
+        rows = [r for r in rows if bool(r.get("Confirmed"))]
     if not rows:
-        st.info("Aucune valeur pour ce segment.")
+        st.info("Aucune valeur pour cette selection.")
         return
 
-    df = pd.DataFrame(rows[:10])
+    df = pd.DataFrame(rows[:15])
+    for col in ("why_selected", "risk_flags"):
+        if col in df.columns:
+            df[col] = df[col].apply(lambda values: ", ".join(values) if isinstance(values, list) else (values or "-"))
+    if "Confirmed" in df.columns:
+        df["Confirmed"] = df["Confirmed"].map(lambda value: "Oui" if bool(value) else "Non")
 
     # Colonnes enrichies si disponibles (cache worker), basiques sinon
     if using_cache:
-        show_cols = ["Nom", "Ticker", "Cours", "Variation (%)", "Capitalisation", "Score",
-                     "B_Setup", "Setup", "RSI", "MACD", "RS_SPY_1m (%)", "Earnings", "Signaux"]
+        show_cols = [
+            "Display_Rank", "Nom", "Ticker", "Setup_Type", "Confirmed", "Score",
+            "Stability_Score", "Consecutive_Hits", "Signal_Age_Minutes",
+            "Cours", "Variation (%)", "Capitalisation", "RSI", "MACD",
+            "RS_SPY_1m (%)", "Distance_MA20 (%)", "Earnings",
+            "why_selected", "risk_flags",
+        ]
     else:
         show_cols = ["Nom", "Ticker", "Cours", "Variation (%)", "Capitalisation", "Score", "Signaux"]
 
@@ -2064,13 +2102,29 @@ def render_midcap_recommendations_section() -> None:
         use_container_width=True,
         hide_index=True,
         column_config={
+            "Display_Rank": st.column_config.NumberColumn("#", format="%d"),
             "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=10, format="%.1f"),
+            "Stability_Score": st.column_config.ProgressColumn("Stabilite", min_value=0, max_value=100, format="%.0f"),
+            "Consecutive_Hits": st.column_config.NumberColumn("Cycles", format="%d"),
+            "Signal_Age_Minutes": st.column_config.NumberColumn("Age signal (min)", format="%.0f"),
             "Variation (%)": st.column_config.NumberColumn("Variation (%)", format="%+.2f%%"),
             "RS_SPY_1m (%)": st.column_config.NumberColumn("RS/SPY 1m", format="%+.1f%%"),
+            "Distance_MA20 (%)": st.column_config.NumberColumn("Distance MA20", format="%+.1f%%"),
             "RSI": st.column_config.NumberColumn("RSI", format="%.0f"),
-            "B_Setup": st.column_config.NumberColumn("Setup score", format="%.1f"),
+            "Setup_Type": st.column_config.TextColumn("Setup"),
+            "Confirmed": st.column_config.TextColumn("Confirme"),
+            "why_selected": st.column_config.TextColumn("Pourquoi"),
+            "risk_flags": st.column_config.TextColumn("Risques"),
         },
     )
+
+    if using_cache and meta:
+        setup_counts = meta.get("setup_counts") or {}
+        st.caption(
+            "Repartition setups : "
+            + ", ".join(f"{name}: {count}" for name, count in setup_counts.items())
+            + f" · seuil confirmation {meta.get('confirm_threshold', '-')}/10 sur {meta.get('confirm_cycles', '-')} cycles"
+        )
 
     # ---- Analyse IA ----
     api_key = get_openai_api_key()

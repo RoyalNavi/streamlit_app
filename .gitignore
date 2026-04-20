@@ -21,6 +21,8 @@ data/market_directory.csv
 data/watchlist.json
 data/briefings/
 data/jwt_secret.key
+data/signals.sqlite3
+data/signals.sqlite3-*
 data/users.sqlite3
 data/users.sqlite3-*
 data/worker.log
