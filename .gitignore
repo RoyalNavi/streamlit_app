@@ -15,6 +15,7 @@ saved_texts/
 ai_chat.txt
 
 data/company_tickers_exchange.json
+data/cache/
 data/crypto_directory.csv
 data/market_directory.csv
 data/watchlist.json
@@ -22,5 +23,6 @@ data/briefings/
 data/jwt_secret.key
 data/users.sqlite3
 data/users.sqlite3-*
+data/worker.log
 
 .DS_Store

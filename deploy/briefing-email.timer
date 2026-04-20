@@ -1,0 +1,10 @@
+[Unit]
+Description=Check scheduled AI briefing email every minute
+
+[Timer]
+OnCalendar=*:0/1
+Persistent=true
+Unit=briefing-email.service
+
+[Install]
+WantedBy=timers.target

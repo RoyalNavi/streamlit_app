@@ -1,0 +1,18 @@
+[Unit]
+Description=Background Worker — Stock Analysis & Briefing
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Documents/streamlit_app
+EnvironmentFile=-/root/Documents/streamlit_app/.env
+ExecStart=/root/Documents/streamlit_app/.venv/bin/python worker.py
+Restart=always
+RestartSec=60
+StandardOutput=append:/var/log/streamlit-worker.log
+StandardError=append:/var/log/streamlit-worker.log
+
+[Install]
+WantedBy=multi-user.target

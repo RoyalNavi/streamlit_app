@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from email.message import EmailMessage
 import hashlib
+import logging
 import hmac
 import shutil
 import subprocess
@@ -19,6 +20,14 @@ import secrets as pysecrets
 import sqlite3
 import xml.etree.ElementTree as ET
 
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("rafik_app")
+
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -29,13 +38,18 @@ try:
 except ImportError:  # pragma: no cover - optional dependency at runtime
     yf = None
 
+try:
+    import trafilatura as _trafilatura
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    _trafilatura = None
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 BRIEFINGS_DIR = DATA_DIR / "briefings"
 MARKET_CACHE_PATH = DATA_DIR / "market_directory.csv"
 CRYPTO_CACHE_PATH = DATA_DIR / "crypto_directory.csv"
-MARKET_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+MARKET_CACHE_TTL_SECONDS = 2 * 24 * 60 * 60
 CRYPTO_CACHE_TTL_SECONDS = 12 * 60 * 60
 USER_AGENT = "rafik-streamlit-app/1.0 (finance dashboard)"
 MAX_COMPARISON_COUNT = 10
@@ -89,9 +103,37 @@ MAJOR_INDICES = [
     {"ticker": "^HSI", "name": "Hang Seng", "exchange": "Index", "asset_type": "Indice"},
 ]
 
+EUROPE_LEADERS = [
+    # France - CAC 40 (Sélection majeure)
+    {"ticker": "MC.PA", "name": "LVMH", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "OR.PA", "name": "L'Oréal", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "TTE.PA", "name": "TotalEnergies", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "SAN.PA", "name": "Sanofi", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "AIR.PA", "name": "Airbus", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "RMS.PA", "name": "Hermès", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "KER.PA", "name": "Kering", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "BNP.PA", "name": "BNP Paribas", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "EL.PA", "name": "EssilorLuxottica", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "DG.PA", "name": "VINCI", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    {"ticker": "SU.PA", "name": "Schneider Electric", "exchange": "Euronext Paris", "asset_type": "Entreprise"},
+    # Allemagne - DAX (Sélection majeure)
+    {"ticker": "SAP.DE", "name": "SAP", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "SIE.DE", "name": "Siemens", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "ALV.DE", "name": "Allianz", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "DTE.DE", "name": "Deutsche Telekom", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "MBG.DE", "name": "Mercedes-Benz", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "VOW3.DE", "name": "Volkswagen", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "BMW.DE", "name": "BMW", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "BAS.DE", "name": "BASF", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "BAYN.DE", "name": "Bayer", "exchange": "XETRA", "asset_type": "Entreprise"},
+    {"ticker": "ADS.DE", "name": "Adidas", "exchange": "XETRA", "asset_type": "Entreprise"},
+    # Autres leaders Européens
+    {"ticker": "ASML.AS", "name": "ASML Holding", "exchange": "Euronext Amsterdam", "asset_type": "Entreprise"},
+]
+
 PERIOD_OPTIONS = {
-    "1 jour": {"period": "1d", "interval": "5m"},
-    "5 jours": {"period": "5d", "interval": "30m"},
+    "1 jour": {"period": "2d", "interval": "5m"},
+    "5 jours": {"period": "6d", "interval": "30m"},
     "1 mois": {"period": "1mo", "interval": "1d"},
     "3 mois": {"period": "3mo", "interval": "1d"},
     "6 mois": {"period": "6mo", "interval": "1d"},
@@ -140,7 +182,11 @@ GENERAL_NEWS_FEEDS = {
         {"label": "Le Figaro - Economie", "url": "https://www.lefigaro.fr/rss/figaro_economie.xml"},
         {"label": "BFM Business - Economie", "url": "https://www.bfmtv.com/rss/economie/"},
         {"label": "BFM Business - Entreprises", "url": "https://www.bfmtv.com/rss/economie/entreprises/"},
+        {"label": "BFM Bourse", "url": "https://www.bfmtv.com/rss/bourse/"},
         {"label": "France 24 - Economie", "url": "https://www.france24.com/fr/%C3%A9co-tech/rss"},
+        {"label": "Les Echos - Une", "url": "https://www.lesechos.fr/rss/rss_une.xml"},
+        {"label": "Les Echos - Finance", "url": "https://www.lesechos.fr/rss/rss_finance-marches.xml"},
+        {"label": "Challenges - Economie", "url": "https://www.challenges.fr/rss.xml"},
     ],
     "Tech / Sciences": [
         {"label": "Le Monde - Pixels", "url": "https://www.lemonde.fr/pixels/rss_full.xml"},
@@ -403,6 +449,81 @@ def init_user_db() -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_portfolio_positions_username ON portfolio_positions(username)"
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_schedule (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                recipients TEXT NOT NULL DEFAULT '["rafik.mo1995@gmail.com"]',
+                send_time TEXT NOT NULL DEFAULT '08:00',
+                last_sent_date TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        for migration in [
+            "ALTER TABLE email_schedule ADD COLUMN recipients TEXT NOT NULL DEFAULT '[\"rafik.mo1995@gmail.com\"]'",
+            "ALTER TABLE email_schedule ADD COLUMN send_time TEXT NOT NULL DEFAULT '08:00'",
+            "ALTER TABLE email_schedule ADD COLUMN last_sent_date TEXT NOT NULL DEFAULT ''",
+        ]:
+            try:
+                connection.execute(migration)
+            except Exception:
+                pass
+
+def execute_query(query: str, params: tuple = (), commit: bool = False):
+    """Utilitaire pour centraliser l'exécution SQL et la gestion d'erreurs."""
+    try:
+        with get_user_db_connection() as conn:
+            cursor = conn.execute(query, params)
+            if commit:
+                conn.commit()
+            return cursor.fetchall()
+    except sqlite3.Error as e:
+        logger.error(f"Database error: {e} | Query: {query}")
+        raise
+
+def get_email_schedule() -> dict:
+    import json as _json
+    with get_user_db_connection() as conn:
+        row = conn.execute(
+            "SELECT enabled, recipients, send_time, last_sent_date FROM email_schedule WHERE id = 1"
+        ).fetchone()
+    if row:
+        try:
+            recipients = _json.loads(row["recipients"])
+        except Exception:
+            recipients = [row["recipients"]] if row["recipients"] else ["rafik.mo1995@gmail.com"]
+        return {
+            "enabled": bool(row["enabled"]),
+            "recipients": recipients,
+            "send_time": row["send_time"] or "08:00",
+            "last_sent_date": row["last_sent_date"] or "",
+        }
+    return {"enabled": False, "recipients": ["rafik.mo1995@gmail.com"], "send_time": "08:00", "last_sent_date": ""}
+
+
+def save_email_schedule(enabled: bool, recipients: list[str], send_time: str) -> None:
+    import json as _json
+    now = datetime.utcnow().isoformat()
+    with get_user_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO email_schedule (id, enabled, recipients, send_time, last_sent_date, updated_at)
+            VALUES (1, ?, ?, ?, '', ?)
+            ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled,
+                                          recipients = excluded.recipients,
+                                          send_time = excluded.send_time,
+                                          updated_at = excluded.updated_at
+            """,
+            (int(enabled), _json.dumps(recipients), send_time, now),
+        )
+
+
+def mark_briefing_email_sent_today() -> None:
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_user_db_connection() as conn:
+        conn.execute("UPDATE email_schedule SET last_sent_date = ? WHERE id = 1", (today,))
 
 
 def record_audit_event(
@@ -420,8 +541,8 @@ def record_audit_event(
                 """,
                 (utc_iso(), actor_username, event_type, target_username, details),
             )
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as e:
+        logger.error(f"Audit log failed: {e}")
 
 
 def hash_session_token(token: str) -> str:
@@ -1542,19 +1663,27 @@ def load_symbol_catalog(cache_marker: float) -> pd.DataFrame:
     _ = cache_marker
     companies = pd.read_csv(MARKET_CACHE_PATH)
     companies["cik"] = ""
+    companies["region"] = "US"
+
     cryptos = pd.read_csv(CRYPTO_CACHE_PATH)
     cryptos["cik"] = ""
+    cryptos["region"] = "Crypto"
 
     indices = pd.DataFrame(MAJOR_INDICES)
     indices["cik"] = ""
+    indices["region"] = "Global"
 
-    catalog = pd.concat([companies, indices, cryptos], ignore_index=True, sort=False)
+    euro_stocks = pd.DataFrame(EUROPE_LEADERS)
+    euro_stocks["cik"] = ""
+    euro_stocks["region"] = "Europe"
+
+    catalog = pd.concat([companies, indices, cryptos, euro_stocks], ignore_index=True, sort=False)
     catalog["ticker"] = catalog["ticker"].astype(str).str.strip().str.upper()
     catalog["name"] = catalog["name"].astype(str).str.strip()
     catalog["exchange"] = catalog["exchange"].fillna("")
     catalog["asset_type"] = catalog["asset_type"].fillna("Entreprise")
     catalog["label"] = catalog.apply(
-        lambda row: f"{row['name']} ({row['ticker']}) - {row['exchange'] or row['asset_type']}",
+        lambda row: f"[{row['region']}] {row['name']} ({row['ticker']}) - {row['exchange'] or row['asset_type']}",
         axis=1,
     )
     catalog = catalog.drop_duplicates(subset=["ticker"], keep="first")
@@ -1581,6 +1710,11 @@ def extract_history_series(
             continue
 
         series = frame[field].dropna()
+        # Si la série est vide (cas fréquent de l'Adj Close sur les indices intraday),
+        # on tente de basculer sur le fallback immédiat
+        if series.empty and field != fallback_field and fallback_field in frame:
+            series = frame[fallback_field].dropna()
+
         if not series.empty:
             series_map[ticker] = series
 
@@ -1590,11 +1724,12 @@ def extract_history_series(
     return history
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def download_price_histories(tickers: tuple[str, ...], period: str, interval: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     if yf is None:
         raise RuntimeError("yfinance n'est pas disponible.")
 
+    # prepost=True permet de capturer les mouvements hors-séance (Pre-market/After-hours)
     raw = yf.download(
         tickers=list(tickers),
         period=period,
@@ -1604,6 +1739,7 @@ def download_price_histories(tickers: tuple[str, ...], period: str, interval: st
         threads=True,
         group_by="ticker",
         multi_level_index=True,
+        prepost=True,
     )
     if raw.empty:
         raise ValueError("Aucune donnee de marche n'a ete renvoyee.")
@@ -1701,156 +1837,264 @@ def format_large_number(value: float | int | None) -> str:
     return f"{int(value)}"
 
 
+_CAP_FILTERS = {
+    "Tout": (300_000_000, None),
+    "Small (<2B)": (300_000_000, 2_000_000_000),
+    "Mid (2-10B)": (2_000_000_000, 10_000_000_000),
+    "Large (>10B)": (10_000_000_000, None),
+}
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_midcap_recommendations(limit: int = 8) -> pd.DataFrame:
+def fetch_stock_ideas(cap_filter: str = "Tout", limit: int = 10) -> pd.DataFrame:
     if yf is None:
         return pd.DataFrame()
 
-    query = yf.EquityQuery(
-        "and",
-        [
-            yf.EquityQuery("eq", ["region", "us"]),
-            yf.EquityQuery("is-in", ["exchange", "NMS", "NYQ", "ASE"]),
-            yf.EquityQuery("gte", ["intradaymarketcap", 2_000_000_000]),
-            yf.EquityQuery("lte", ["intradaymarketcap", 10_000_000_000]),
-            yf.EquityQuery("gte", ["intradayprice", 5]),
-            yf.EquityQuery("gt", ["dayvolume", 250_000]),
-        ],
-    )
+    cap_min, cap_max = _CAP_FILTERS.get(cap_filter, (300_000_000, None))
+    filters = [
+        yf.EquityQuery("eq", ["region", "us"]),
+        yf.EquityQuery("is-in", ["exchange", "NMS", "NYQ", "ASE"]),
+        yf.EquityQuery("gte", ["intradaymarketcap", cap_min]),
+        yf.EquityQuery("gte", ["intradayprice", 5]),
+        yf.EquityQuery("gt", ["dayvolume", 200_000]),
+    ]
+    if cap_max is not None:
+        filters.append(yf.EquityQuery("lte", ["intradaymarketcap", cap_max]))
 
     try:
-        payload = yf.screen(query, size=100, sortField="percentchange", sortAsc=False)
+        payload = yf.screen(yf.EquityQuery("and", filters), size=150, sortField="percentchange", sortAsc=False)
     except Exception:
         return pd.DataFrame()
 
-    rows = []
     excluded_name_pattern = re.compile(
         r"Warrant|Rights?|Units?|Preferred|Depositary|Trust Preferred|Acquisition Corp",
         re.IGNORECASE,
     )
+    rows = []
     for quote in payload.get("quotes", []):
         ticker = str(quote.get("symbol") or "").upper()
         name = str(quote.get("shortName") or quote.get("longName") or ticker)
         if not ticker or excluded_name_pattern.search(name):
             continue
 
-        price = quote.get("regularMarketPrice") or quote.get("intradayprice")
-        day_change = quote.get("regularMarketChangePercent") or quote.get("percentchange")
-        market_cap = quote.get("marketCap") or quote.get("intradaymarketcap")
-        volume = quote.get("regularMarketVolume") or quote.get("dayvolume")
-        fifty_day = quote.get("fiftyDayAverage")
-        two_hundred_day = quote.get("twoHundredDayAverage")
-        week_high = quote.get("fiftyTwoWeekHigh")
-        week_low = quote.get("fiftyTwoWeekLow")
-
-        numeric_values = pd.to_numeric(
-            pd.Series(
-                {
-                    "price": price,
-                    "day_change": day_change,
-                    "market_cap": market_cap,
-                    "volume": volume,
-                    "fifty_day": fifty_day,
-                    "two_hundred_day": two_hundred_day,
-                    "week_high": week_high,
-                    "week_low": week_low,
-                }
-            ),
+        raw = pd.to_numeric(
+            pd.Series({
+                "price": quote.get("regularMarketPrice") or quote.get("intradayprice"),
+                "day_change": quote.get("regularMarketChangePercent") or quote.get("percentchange"),
+                "market_cap": quote.get("marketCap") or quote.get("intradaymarketcap"),
+                "volume": quote.get("regularMarketVolume") or quote.get("dayvolume"),
+                "avg_volume": quote.get("averageDailyVolume3Month") or quote.get("averageDailyVolume10Day"),
+                "fifty_day": quote.get("fiftyDayAverage"),
+                "two_hundred_day": quote.get("twoHundredDayAverage"),
+                "week_high": quote.get("fiftyTwoWeekHigh"),
+                "week_low": quote.get("fiftyTwoWeekLow"),
+            }),
             errors="coerce",
         )
-        price = numeric_values["price"]
-        day_change = numeric_values["day_change"]
-        market_cap = numeric_values["market_cap"]
-        volume = numeric_values["volume"]
-        fifty_day = numeric_values["fifty_day"]
-        two_hundred_day = numeric_values["two_hundred_day"]
-        week_high = numeric_values["week_high"]
-        week_low = numeric_values["week_low"]
+        price, day_change, market_cap, volume = raw["price"], raw["day_change"], raw["market_cap"], raw["volume"]
+        avg_volume = raw["avg_volume"]
+        fifty_day, two_hundred_day = raw["fifty_day"], raw["two_hundred_day"]
+        week_high, week_low = raw["week_high"], raw["week_low"]
+
         if pd.isna(price) or pd.isna(market_cap) or pd.isna(day_change):
             continue
 
         reasons = []
         score = 0.0
-        if 2_000_000_000 <= market_cap <= 10_000_000_000:
-            score += 1.5
-            reasons.append("taille mid-cap")
-        if not pd.isna(volume) and volume >= 1_000_000:
-            score += 1.2
-            reasons.append("bonne liquidite")
-        if not pd.isna(day_change) and day_change > 0:
-            score += min(float(day_change), 8.0) * 0.35
-            reasons.append("momentum seance positif")
-        if not pd.isna(fifty_day) and price > fifty_day:
-            score += 1.4
-            reasons.append("cours au-dessus de la moyenne 50j")
-        if not pd.isna(fifty_day) and not pd.isna(two_hundred_day) and fifty_day > two_hundred_day:
-            score += 1.8
-            reasons.append("tendance 50j > 200j")
-        if not pd.isna(week_high) and week_high > 0 and price >= week_high * 0.85:
-            score += 1.0
-            reasons.append("proche des plus hauts 52 semaines")
-        if not pd.isna(week_low) and week_low > 0 and price >= week_low * 1.25:
-            score += 0.8
-            reasons.append("rebond confirme vs point bas")
 
-        rows.append(
-            {
-                "Nom": name,
-                "Ticker": ticker,
-                "Marche": quote.get("fullExchangeName") or "-",
-                "Cours": round(float(price), 2),
-                "Variation seance (%)": round(float(day_change), 2),
-                "Capitalisation": format_money(market_cap),
-                "Volume": format_large_number(volume),
-                "Score": round(min(score, 10.0), 1),
-                "Pourquoi": ", ".join(reasons[:3]) or "profil a verifier",
-            }
-        )
+        if not pd.isna(day_change) and day_change > 0:
+            score += min(float(day_change), 8.0) * 0.4
+            reasons.append("momentum positif")
+        if not pd.isna(fifty_day) and price > fifty_day:
+            score += 1.6
+            reasons.append("au-dessus MA50")
+        if not pd.isna(fifty_day) and not pd.isna(two_hundred_day) and fifty_day > two_hundred_day:
+            score += 2.0
+            reasons.append("tendance 50j>200j")
+        if not pd.isna(week_high) and week_high > 0 and price >= week_high * 0.90:
+            score += 1.5
+            reasons.append("proche sommet 52s")
+        if not pd.isna(week_low) and week_low > 0 and price >= week_low * 1.30:
+            score += 0.6
+            reasons.append("rebond confirme")
+        if not pd.isna(volume) and not pd.isna(avg_volume) and avg_volume > 0 and volume >= avg_volume * 1.5:
+            score += 1.2
+            reasons.append("volume inhabituel")
+        elif not pd.isna(volume) and volume >= 1_000_000:
+            score += 0.8
+            reasons.append("bonne liquidite")
+
+        rows.append({
+            "Nom": name,
+            "Ticker": ticker,
+            "Cours": round(float(price), 2),
+            "Variation (%)": round(float(day_change), 2),
+            "Capitalisation": format_money(market_cap),
+            "Volume": format_large_number(volume),
+            "Score": round(min(score, 10.0), 1),
+            "Signaux": ", ".join(reasons[:3]) or "-",
+            "_market_cap_raw": float(market_cap),
+        })
 
     if not rows:
         return pd.DataFrame()
 
     frame = pd.DataFrame(rows)
-    return frame.sort_values(["Score", "Variation seance (%)"], ascending=[False, False]).head(limit).reset_index(drop=True)
+    return frame.sort_values(["Score", "Variation (%)"], ascending=[False, False]).head(limit).reset_index(drop=True)
+
+
+def fetch_midcap_recommendations(limit: int = 8) -> pd.DataFrame:
+    return fetch_stock_ideas("Mid (2-10B)", limit)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_stock_news_headlines(ticker: str) -> list[str]:
+    if yf is None:
+        return []
+    try:
+        news = yf.Ticker(ticker).news or []
+        return [item.get("content", {}).get("title") or item.get("title") or "" for item in news[:5] if item]
+    except Exception:
+        return []
+
+
+def analyze_stocks_with_ai(rows: list[dict], api_key: str) -> dict:
+    import json as _json
+    lines = []
+    for r in rows:
+        headlines = fetch_stock_news_headlines(r["Ticker"])
+        actu = " | ".join(h for h in headlines if h) or "Aucune actu disponible"
+        lines.append(
+            f"{r['Ticker']} ({r['Nom']}) — Cap: {r['Capitalisation']} — "
+            f"Variation: {r['Variation (%)']:+.1f}% — Score tech: {r['Score']}/10 — "
+            f"Signaux: {r['Signaux']}\n  Actu: {actu}"
+        )
+
+    prompt = (
+        "Tu es analyste financier. Pour chaque action ci-dessous, reponds en JSON avec exactement ce format:\n"
+        '{"TICKER": {"sentiment": "🟢"|"🟡"|"🔴", "catalyseur": "5 mots max", "risque": "5 mots max", "commentaire": "1 phrase courte en francais"}}\n\n'
+        "Actions:\n" + "\n\n".join(lines)
+    )
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+            timeout=30,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        start, end = content.find("{"), content.rfind("}") + 1
+        return _json.loads(content[start:end]) if start != -1 else {}
+    except Exception:
+        return {}
 
 
 def render_midcap_recommendations_section() -> None:
-    st.subheader("Mid-cap a fort potentiel")
-    st.caption(
-        "Selection quantitative de valeurs US entre 2B$ et 10B$ de capitalisation, a considerer comme une liste d'idees a analyser."
-    )
+    from cache import read_cache, cache_freshness_label, cache_age_minutes
 
-    with st.spinner("Je cherche des mid-cap avec momentum et liquidite..."):
-        try:
-            recommendations = fetch_midcap_recommendations(limit=8)
-        except Exception as exc:  # pragma: no cover - depends on network/provider
-            st.info(f"Impossible de charger les idees mid-cap pour le moment : {exc}")
-            return
+    st.subheader("Valeurs a fort potentiel")
 
-    if recommendations.empty:
-        st.info("Aucune mid-cap exploitable pour le moment.")
+    # ---- Lecture du cache worker ----
+    cached = read_cache("stock_ideas")
+    using_cache = cached is not None and cached.get("data")
+
+    if using_cache:
+        age = cache_age_minutes("stock_ideas") or 0
+        if age < 35:
+            st.caption(
+                f"🟢 Worker actif — analyse mise a jour {cache_freshness_label('stock_ideas')} "
+                f"· univers equilibre Small/Mid/Large · RSI · MACD · Setup MA20 · RS vs SPY · Earnings"
+            )
+        elif age < 90:
+            st.warning(f"🟡 Derniere analyse il y a {int(age)} min — le worker semble lent ou redemarrage en cours.")
+        else:
+            st.error(
+                f"🔴 Worker arrete — donnees agees de {cache_freshness_label('stock_ideas')}. "
+                f"Verifier : `systemctl status worker`"
+            )
+        all_rows = cached["data"]
+    else:
+        st.warning(
+            "⚠️ Worker pas encore demarre — mode fallback actif. "
+            "Les scores sont simplifies (pas d'historique, pas de Setup, pas d'Earnings). "
+            "Lancer le worker : `systemctl start worker`"
+        )
+        with st.spinner("Chargement live (simplifie)..."):
+            try:
+                live_df = fetch_stock_ideas("Tout", limit=15)
+                all_rows = live_df.to_dict("records") if not live_df.empty else []
+            except Exception as exc:
+                st.info(f"Impossible de charger les idees : {exc}")
+                return
+
+    if not all_rows:
+        st.info("Aucune valeur disponible pour le moment.")
         return
 
+    # ---- Filtre segment ----
+    cap_limits = {
+        "Tout": (0, float("inf")),
+        "Small (<2B)": (0, 2e9),
+        "Mid (2-10B)": (2e9, 10e9),
+        "Large (>10B)": (10e9, float("inf")),
+    }
+    filter_col, _ = st.columns([2, 4])
+    cap_filter = filter_col.selectbox("Segment", options=list(cap_limits.keys()), index=0, key="stock_ideas_cap_filter")
+    cap_min, cap_max = cap_limits[cap_filter]
+    rows = [r for r in all_rows if cap_min <= r.get("cap_raw", r.get("_market_cap_raw", 0)) < cap_max]
+    if not rows:
+        st.info("Aucune valeur pour ce segment.")
+        return
+
+    df = pd.DataFrame(rows[:10])
+
+    # Colonnes enrichies si disponibles (cache worker), basiques sinon
+    if using_cache:
+        show_cols = ["Nom", "Ticker", "Cours", "Variation (%)", "Capitalisation", "Score",
+                     "B_Setup", "Setup", "RSI", "MACD", "RS_SPY_1m (%)", "Earnings", "Signaux"]
+    else:
+        show_cols = ["Nom", "Ticker", "Cours", "Variation (%)", "Capitalisation", "Score", "Signaux"]
+
+    display_cols = [c for c in show_cols if c in df.columns]
+
     st.dataframe(
-        recommendations,
-        width="stretch",
+        df[display_cols],
+        use_container_width=True,
         hide_index=True,
         column_config={
-            "Score": st.column_config.ProgressColumn(
-                "Score",
-                min_value=0,
-                max_value=10,
-                format="%.1f",
-            )
+            "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=10, format="%.1f"),
+            "Variation (%)": st.column_config.NumberColumn("Variation (%)", format="%+.2f%%"),
+            "RS_SPY_1m (%)": st.column_config.NumberColumn("RS/SPY 1m", format="%+.1f%%"),
+            "RSI": st.column_config.NumberColumn("RSI", format="%.0f"),
+            "B_Setup": st.column_config.NumberColumn("Setup score", format="%.1f"),
         },
     )
 
-    with st.expander("Methode de selection"):
-        st.write(
-            "Le score favorise les actions mid-cap liquides, en hausse sur la seance, au-dessus de leur moyenne 50 jours, "
-            "avec une tendance 50 jours superieure a la moyenne 200 jours quand ces donnees sont disponibles. "
-            "Ce n'est pas un conseil financier : verifie les fondamentaux, la valorisation, les resultats et le risque avant toute decision."
-        )
+    # ---- Analyse IA ----
+    api_key = get_openai_api_key()
+    if api_key:
+        if st.button("Analyser avec l'IA (news + sentiment)", key="stock_ideas_ai_btn", use_container_width=True):
+            with st.spinner("Je recupere les news et j'analyse avec GPT-4o-mini..."):
+                ai_results = analyze_stocks_with_ai(df[display_cols].to_dict("records"), api_key)
+                st.session_state["stock_ideas_ai"] = ai_results
+                st.session_state["stock_ideas_ai_tickers"] = list(df["Ticker"])
+
+    ai_results = st.session_state.get("stock_ideas_ai", {})
+    if ai_results and set(st.session_state.get("stock_ideas_ai_tickers", [])) & set(df["Ticker"]):
+        st.divider()
+        st.caption("Analyse IA — basee sur les dernieres actu Yahoo Finance")
+        for _, row in df.iterrows():
+            ticker = row["Ticker"]
+            analysis = ai_results.get(ticker)
+            if not analysis:
+                continue
+            c1, c2, c3, c4 = st.columns([1, 2, 2, 4])
+            c1.markdown(f"**{analysis.get('sentiment','🟡')} {ticker}**")
+            c2.caption(f"Catalyseur : {analysis.get('catalyseur','-')}")
+            c3.caption(f"Risque : {analysis.get('risque','-')}")
+            c4.write(analysis.get("commentaire", ""))
 
 
 def render_market_movers_section(catalog: pd.DataFrame) -> None:
@@ -2382,8 +2626,8 @@ def build_daily_news_recap(
 
     midcap_records = dataframe_records(midcaps)
     if midcap_records:
-        text_lines.extend(["", "Idees mid-cap"])
-        html_sections.append("<h2>Idees mid-cap</h2><ul>")
+        text_lines.extend(["", "Valeurs a fort potentiel"])
+        html_sections.append("<h2>Valeurs a fort potentiel</h2><ul>")
         for row in midcap_records:
             name = str(row.get("Nom") or "-")
             ticker = str(row.get("Ticker") or "-")
@@ -2541,6 +2785,51 @@ def compact_news_item(item: dict) -> dict:
         "published_at": item.get("published_at") or "",
         "url": item.get("url") or "",
     }
+
+
+def fetch_article_content(url: str, max_chars: int = 1800) -> str:
+    if _trafilatura is None or not url:
+        return ""
+    try:
+        response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=8)
+        response.raise_for_status()
+        content = _trafilatura.extract(
+            response.text,
+            include_comments=False,
+            include_tables=False,
+            no_fallback=False,
+        )
+        if content:
+            return content[:max_chars]
+    except Exception:
+        pass
+    return ""
+
+
+def enrich_news_items_with_content(items: list[dict], top_n: int = 18) -> list[dict]:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    to_enrich = items[:top_n]
+    rest = items[top_n:]
+
+    enriched: list[dict | None] = [None] * len(to_enrich)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(fetch_article_content, item.get("url") or "", 2500): i
+            for i, item in enumerate(to_enrich)
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                content = future.result()
+                rss_summary = to_enrich[i].get("summary") or ""
+                # Use RSS summary as fallback when full content unavailable (paywall etc.)
+                effective_content = content or rss_summary
+                enriched[i] = {**to_enrich[i], "content": effective_content} if effective_content else to_enrich[i]
+            except Exception:
+                enriched[i] = to_enrich[i]
+
+    return [item for item in enriched if item is not None] + rest
 
 
 def normalize_news_title(value: str) -> str:
@@ -2739,22 +3028,21 @@ def collect_podcast_briefing_context(
     else:
         gainers, losers, midcaps = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
+    deduped = dedupe_compact_news(all_news, limit=35)
+    enriched_news = enrich_news_items_with_content(deduped, top_n=12)
+
     return {
         "generated_at": generated_at,
         "categories": selected_categories,
-        "top_news": dedupe_compact_news(all_news, limit=35),
-        "topic_clusters": build_news_topic_clusters(all_news, limit=8),
+        "top_news": enriched_news,
+        "topic_clusters": build_news_topic_clusters(enriched_news, limit=8),
         "category_sections": category_sections,
         "market_snapshot": market_snapshot_records() if include_market_context else [],
         "gainers": dataframe_records(gainers, limit=5),
         "losers": dataframe_records(losers, limit=5),
         "midcaps": dataframe_records(midcaps, limit=5),
         "portfolio": portfolio_briefing_summary(current_user) if include_portfolio else {},
-        "editorial_note": (
-            "Briefing generaliste : les marches financiers doivent etre traites comme un sujet parmi les autres, "
-            "uniquement s'ils ressortent des rubriques selectionnees ou si le contexte marche est explicitement inclus."
-        ),
-        "source_labels": sorted({item["source"] for item in all_news if item.get("source")}),
+        "source_labels": sorted({item["source"] for item in enriched_news if item.get("source")}),
     }
 
 
@@ -2823,36 +3111,106 @@ def build_fallback_podcast_script(context: dict, duration_minutes: int) -> str:
 
 
 def build_podcast_script_prompt(context: dict, duration_minutes: int, tone: str) -> str:
-    target_words = {3: "450 a 600", 5: "750 a 950", 10: "1300 a 1600"}.get(duration_minutes, "1300 a 1600")
-    context_json = json.dumps(context, ensure_ascii=False, default=str)[:22000]
-    return f"""
-Tu es redacteur en chef d'un podcast quotidien en francais.
+    target_words = {3: "550 a 700", 5: "950 a 1200", 10: "2000 a 2500"}.get(duration_minutes, "2000 a 2500")
+    word_budget = {
+        3: {"principal": "250-300", "secondaires": "100-120 chacun (2 sujets)", "conclusion": "50"},
+        5: {"principal": "400-500", "secondaires": "120-150 chacun (3-4 sujets)", "conclusion": "60"},
+        10: {"principal": "700-900", "secondaires": "180-250 chacun (5-6 sujets)", "conclusion": "80"},
+    }.get(duration_minutes, {"principal": "700-900", "secondaires": "180-250 chacun (5-6 sujets)", "conclusion": "80"})
 
-Objectif : produire un script parle naturel d'environ {duration_minutes} minutes, soit {target_words} mots.
+    parts: list[str] = []
+
+    top_news = context.get("top_news", [])
+    enriched = [item for item in top_news if item.get("content")]
+    flash = [item for item in top_news if not item.get("content")]
+
+    if enriched:
+        parts.append("=== ARTICLES PRINCIPAUX (contenu complet disponible) ===")
+        for item in enriched[:10]:
+            pub = (item.get("published_at") or "")[:10]
+            parts.append(f"\n[{item.get('source')} — {pub or 'date inconnue'}]")
+            parts.append(f"Titre : {item.get('title')}")
+            parts.append(f"Contenu :\n{item.get('content', '')[:1600]}")
+
+    if flash:
+        parts.append("\n=== AUTRES TITRES ===")
+        for item in flash[:20]:
+            summary = (item.get("summary") or "")[:120]
+            line = f"• {item.get('title')} [{item.get('source')}]"
+            if summary:
+                line += f" — {summary}"
+            parts.append(line)
+
+    clusters = context.get("topic_clusters", [])
+    if clusters:
+        parts.append("\n=== SUJETS QUI REVIENNENT DANS PLUSIEURS SOURCES ===")
+        for cluster in clusters[:5]:
+            sources_str = ", ".join(cluster.get("sources", [])[:3])
+            parts.append(
+                f"• {cluster.get('main_title')} "
+                f"({cluster.get('article_count')} articles — {sources_str})"
+            )
+
+    market = context.get("market_snapshot", [])
+    if market:
+        parts.append("\n=== MARCHES FINANCIERS ===")
+        for row in market[:8]:
+            parts.append(f"• {row.get('Actif')}: {row.get('Dernier')} — 1j: {row.get('1j')}% — 1m: {row.get('1m')}%")
+
+    portfolio = context.get("portfolio") or {}
+    if portfolio and portfolio.get("value"):
+        parts.append("\n=== PORTEFEUILLE ===")
+        parts.append(
+            f"Valeur: {portfolio.get('value', 0):.2f} — "
+            f"PnL: {portfolio.get('pnl', 0):.2f} ({portfolio.get('performance_percent')}%)"
+        )
+        best = portfolio.get("best_line") or {}
+        worst = portfolio.get("worst_line") or {}
+        if best.get("Ticker"):
+            parts.append(f"Meilleure position: {best.get('Ticker')} +{best.get('PnL latent (%)', 0):.1f}%")
+        if worst.get("Ticker"):
+            parts.append(f"Moins bonne position: {worst.get('Ticker')} {worst.get('PnL latent (%)', 0):.1f}%")
+        ticker_news = portfolio.get("ticker_news", [])
+        if ticker_news:
+            parts.append("Actualites sur les positions :")
+            for tn in ticker_news[:5]:
+                parts.append(f"  • {tn.get('title')} [{tn.get('source')}]")
+
+    context_text = "\n".join(parts)
+
+    return f"""Tu es redacteur en chef d'un podcast quotidien en francais.
+
+CONTRAINTE DE LONGUEUR ABSOLUE : le script DOIT contenir entre {target_words} mots.
+Ne termine PAS avant d'avoir atteint le minimum. Compte mentalement tes mots au fil de la redaction.
+
 Ton : {tone}.
 
-Structure souhaitee :
-- Commence simplement par "Bonjour Rafik." puis va directement au vif du sujet.
-- Pas d'introduction lourde, pas de phrase du type "ce briefing est genere par IA", pas de presentation technique.
-- Identifie le sujet principal du jour a partir de topic_clusters et top_news.
-- Creuse ce sujet principal un peu plus que les autres : contexte, pourquoi il ressort, angles differents entre sources, ce qu'il faut surveiller.
-- Ensuite seulement, fais un tour des autres infos importantes, de maniere concise.
-- Termine courtement, sans conclusion pompeuse.
+STRUCTURE ET BUDGET DE MOTS :
+1. Sujet principal ({word_budget['principal']} mots) :
+   - Identifie le sujet dominant du jour (celui qui revient dans plusieurs sources ou le plus developpe).
+   - Donne le contexte complet : pourquoi c'est important, historique recent si utile, chiffres cles.
+   - Compare les angles des differentes sources sur ce sujet.
+   - Explique les implications concretes et ce qu'il faut surveiller.
 
-Contraintes :
-- Ne recopie pas longuement les articles. Resume et reformule.
-- N'invente aucun fait absent du contexte.
-- Cite legerement les medias quand c'est utile, sans transformer le podcast en bibliographie.
-- Ce briefing est generaliste. Ne fais pas de focus particulier sur les marches financiers.
-- Traite les marches financiers comme n'importe quel autre sujet d'actualite : seulement s'ils sont importants dans les infos selectionnees ou si le contexte marche est fourni explicitement.
-- Ne cree pas de rubrique financiere obligatoire.
-- Structure le briefing : sujet principal approfondi, autres infos, portefeuille uniquement si disponible, points a surveiller.
-- Ajoute un avertissement financier uniquement si tu parles explicitement de portefeuille, d'actions ou d'investissement.
-- Ecris uniquement le script final, sans JSON ni commentaires techniques.
+2. Sujets secondaires ({word_budget['secondaires']}) :
+   - Pour chaque sujet secondaire : donne le contexte, les faits importants, une implication concrete.
+   - Ne fais pas de simples titres lus : developpe vraiment chaque point.
 
-Contexte structure :
-{context_json}
-""".strip()
+3. Point marche ou portefeuille (200 mots si disponible dans le contexte).
+
+4. Conclusion ({word_budget['conclusion']} mots) : une phrase de cloture naturelle, sans formule pompeuse.
+
+Regles strictes :
+- Commence par "Bonjour Rafik." puis vas immediatement au contenu.
+- N'invente aucun fait absent du contexte ci-dessous.
+- Reformule et enrichis, ne recopie pas les articles mot pour mot.
+- Cite les sources avec naturalite (ex: "selon Le Monde", "d'apres Les Echos").
+- Ecris uniquement le script final pret a etre lu, sans JSON ni commentaires techniques.
+- Si le contexte est riche, developpe davantage. Mieux vaut 2400 mots que 1800 pour un podcast de 10 minutes.
+
+--- CONTEXTE DU JOUR ---
+{context_text}
+--- FIN DU CONTEXTE ---""".strip()
 
 
 def extract_openai_output_text(payload: dict) -> str:
@@ -2866,12 +3224,53 @@ def extract_openai_output_text(payload: dict) -> str:
     return "\n".join(pieces).strip()
 
 
+def select_top_articles_with_llm(items: list[dict], api_key: str, n: int = 12) -> list[dict]:
+    """Passe 1 : demande au LLM de choisir les articles les plus importants."""
+    if not api_key or len(items) <= n:
+        return items[:n]
+
+    lines = []
+    for i, item in enumerate(items[:35]):
+        snippet = (item.get("content") or item.get("summary") or "")[:200]
+        lines.append(f"{i + 1}. [{item.get('source')}] {item.get('title')} — {snippet}")
+
+    prompt = (
+        f"Tu es un editeur de presse. Voici {len(lines)} articles du jour.\n\n"
+        f"Selectionne les {n} articles les plus importants pour un briefing quotidien generaliste en francais.\n"
+        "Criteres : importance nationale ou internationale, impact societal ou economique, diversite des sujets.\n"
+        f"Reponds UNIQUEMENT avec les numeros separes par des virgules. Exemple : 2, 5, 7, 12\n\n"
+        + "\n".join(lines)
+    )
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": PODCAST_SCRIPT_MODEL, "input": prompt, "max_output_tokens": 80},
+            timeout=30,
+        )
+        response.raise_for_status()
+        text = extract_openai_output_text(response.json()).strip()
+        indices = [int(x.strip()) - 1 for x in re.split(r"[,\s]+", text) if x.strip().isdigit()]
+        selected = [items[i] for i in indices if 0 <= i < len(items)]
+        if len(selected) >= 5:
+            return selected[:n]
+    except Exception:
+        pass
+    return items[:n]
+
+
 def generate_podcast_script(context: dict, duration_minutes: int, tone: str) -> tuple[str, str]:
     api_key = get_openai_api_key()
     if not api_key:
         return build_fallback_podcast_script(context, duration_minutes), "fallback"
 
-    prompt = build_podcast_script_prompt(context, duration_minutes, tone)
+    # Passe 1 : sélection des articles les plus importants
+    top_news = context.get("top_news", [])
+    selected_articles = select_top_articles_with_llm(top_news, api_key, n=12)
+    enriched_context = {**context, "top_news": selected_articles}
+
+    # Passe 2 : génération du script complet
+    prompt = build_podcast_script_prompt(enriched_context, duration_minutes, tone)
     response = requests.post(
         "https://api.openai.com/v1/responses",
         headers={
@@ -2881,9 +3280,9 @@ def generate_podcast_script(context: dict, duration_minutes: int, tone: str) -> 
         json={
             "model": PODCAST_SCRIPT_MODEL,
             "input": prompt,
-            "max_output_tokens": 2600,
+            "max_output_tokens": 6000,
         },
-        timeout=90,
+        timeout=120,
     )
     response.raise_for_status()
     script = extract_openai_output_text(response.json())
@@ -3284,14 +3683,44 @@ def delete_portfolio_position(username: str, position_id: int) -> None:
 def fetch_latest_prices(tickers: tuple[str, ...]) -> dict[str, float]:
     if yf is None or not tickers:
         return {}
-    price_history, _ = download_price_histories(tickers, period="5d", interval="1d")
+
     prices: dict[str, float] = {}
+
+    def collect_from_history(period: str, interval: str, pending: tuple[str, ...]) -> None:
+        if not pending:
+            return
+        try:
+            price_history, _ = download_price_histories(pending, period=period, interval=interval)
+        except Exception:
+            return
+        for ticker in pending:
+            if ticker not in price_history.columns:
+                continue
+            series = price_history[ticker].dropna()
+            if not series.empty:
+                prices[ticker] = float(series.iloc[-1])
+
+    # Fresh intraday prices first, then robust daily fallback for tickers that
+    # Yahoo does not return reliably in 5-minute mode.
+    collect_from_history("2d", "5m", tickers)
+    missing = tuple(ticker for ticker in tickers if ticker not in prices)
+    collect_from_history("10d", "1d", missing)
+
     for ticker in tickers:
-        if ticker not in price_history.columns:
+        if ticker in prices:
             continue
-        series = price_history[ticker].dropna()
-        if not series.empty:
-            prices[ticker] = float(series.iloc[-1])
+        try:
+            fast_info = yf.Ticker(ticker).fast_info
+            fallback_price = (
+                fast_info.get("lastPrice")
+                or fast_info.get("last_price")
+                or fast_info.get("regularMarketPrice")
+                or fast_info.get("previousClose")
+            )
+            if fallback_price is not None:
+                prices[ticker] = float(fallback_price)
+        except Exception:
+            continue
     return prices
 
 
@@ -3319,7 +3748,7 @@ def fetch_reference_purchase_price(ticker: str, purchase_date: str) -> float | N
             start=start.strftime("%Y-%m-%d"),
             end=end.strftime("%Y-%m-%d"),
             interval="1d",
-            auto_adjust=False,
+        auto_adjust=True,
             progress=False,
             threads=False,
             group_by="ticker",
@@ -3440,18 +3869,24 @@ def build_portfolio_performance_history(portfolio: pd.DataFrame) -> pd.DataFrame
         return pd.DataFrame()
 
     earliest_date = str(priced["Date achat"].min())
-    period = choose_history_period_from_date(earliest_date)
-    tickers = tuple(sorted(priced["Ticker"].unique()))
-    try:
-        price_history, _ = download_price_histories(tickers, period=period, interval="1d")
-    except Exception:
-        return pd.DataFrame()
-
     start_date = pd.to_datetime(earliest_date, errors="coerce")
     if pd.isna(start_date):
         return pd.DataFrame()
+    age_days = max(1, (pd.Timestamp(datetime.now().date()) - start_date.normalize()).days)
+    if age_days <= 7:
+        period = "5d"
+        interval = "30m"
+    else:
+        period = choose_history_period_from_date(earliest_date)
+        interval = "1d"
+    tickers = tuple(sorted(priced["Ticker"].unique()))
+    try:
+        price_history, _ = download_price_histories(tickers, period=period, interval=interval)
+    except Exception:
+        return pd.DataFrame()
+
     if isinstance(price_history.index, pd.DatetimeIndex):
-        price_history = price_history[price_history.index.normalize() >= start_date.normalize()]
+        price_history = price_history[price_history.index.date >= start_date.date()]
     if price_history.empty:
         return pd.DataFrame()
 
@@ -3464,7 +3899,7 @@ def build_portfolio_performance_history(portfolio: pd.DataFrame) -> pd.DataFrame
         purchase_date = pd.to_datetime(row["Date achat"], errors="coerce")
         if pd.isna(purchase_date):
             continue
-        active_mask = price_history.index.normalize() >= purchase_date.normalize()
+        active_mask = price_history.index.date >= purchase_date.date()
         line_prices = price_history[ticker].ffill()
         quantity = float(row["Quantite"])
         cost_basis = float(row["Quantite"]) * float(row["Prix achat"])
@@ -3488,21 +3923,21 @@ def build_portfolio_performance_figure(history: pd.DataFrame) -> go.Figure:
     fig.add_trace(
         go.Scatter(
             x=x_values,
-            y=history["Performance (%)"],
+            y=history["Valeur"],
             mode="lines",
-            name="Portefeuille",
+            name="Valeur du portefeuille",
             line=dict(color="#2563eb", width=3),
-            hovertemplate="Date : %{x}<br>Performance : %{y:.2f}%<extra></extra>",
+            hovertemplate="Date : %{x}<br>Valeur : %{y:.2f}<extra></extra>",
         )
     )
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.update_layout(
-        title="Performance du portefeuille",
+        title="Valeur du portefeuille",
         xaxis_title="Date",
-        yaxis_title="Performance (%)",
+        yaxis_title="Montant",
         template="plotly_white",
         hovermode="x unified",
         margin=dict(l=30, r=30, t=60, b=30),
+        showlegend=False,
     )
     fig.update_xaxes(type="category")
     return fig
@@ -4073,53 +4508,52 @@ def render_portfolio_section(catalog: pd.DataFrame, current_user: sqlite3.Row) -
     if missing_quotes:
         st.caption("Les positions sans cotation recente restent visibles, mais elles sont exclues du PnL et de la performance totale.")
 
-    portfolio_history = build_portfolio_performance_history(portfolio)
-    if not portfolio_history.empty:
-        st.plotly_chart(build_portfolio_performance_figure(portfolio_history), width="stretch")
-    else:
-        st.info("La courbe de performance apparaitra des que l'historique de prix sera disponible.")
-
     display_portfolio = portfolio[
         [
             "Nom",
             "Ticker",
-            "Type",
-            "Secteur",
-            "Devise",
-            "Quantite",
-            "Prix achat",
-            "Dernier cours",
             "PRU total",
             "Valeur actuelle",
-            "PnL latent",
+            "Dernier cours",
             "PnL latent (%)",
-            "Contribution perf (%)",
-            "Date achat",
-            "Note",
+            "PnL latent",
         ]
     ].copy()
     display_portfolio = display_portfolio.rename(
         columns={
-            "Quantite": "Quantite calculee",
-            "Prix achat": "Prix utilise",
             "PRU total": "Montant investi",
+            "Dernier cours": "Prix de l'action",
+            "PnL latent (%)": "PnL (%)",
+            "PnL latent": "PnL ($)",
         }
     )
+
+    def color_pnl(val):
+        if pd.isna(val): return None
+        return "color: #15803d" if val >= 0 else "color: #b91c1c"
+
+    # Utilisation de .map() au lieu de .applymap() pour la compatibilité Pandas 2.1+
+    styled_portfolio = display_portfolio.style.map(color_pnl, subset=["PnL (%)", "PnL ($)"])
+
     st.dataframe(
-        display_portfolio,
+        styled_portfolio,
         width="stretch",
         hide_index=True,
         column_config={
-            "PnL latent (%)": st.column_config.NumberColumn("PnL latent (%)", format="%.2f%%"),
-            "Contribution perf (%)": st.column_config.NumberColumn("Contribution perf (%)", format="%.2f%%"),
-            "Quantite calculee": st.column_config.NumberColumn("Quantite calculee", format="%.6g"),
-            "Prix utilise": st.column_config.NumberColumn("Prix utilise", format="%.2f"),
-            "Dernier cours": st.column_config.NumberColumn("Dernier cours", format="%.2f"),
+            "PnL (%)": st.column_config.NumberColumn("PnL (%)", format="%.2f%%"),
+            "Prix de l'action": st.column_config.NumberColumn("Prix de l'action", format="%.2f"),
             "Montant investi": st.column_config.NumberColumn("Montant investi", format="%.2f"),
             "Valeur actuelle": st.column_config.NumberColumn("Valeur actuelle", format="%.2f"),
-            "PnL latent": st.column_config.NumberColumn("PnL latent", format="%.2f"),
+            "PnL ($)": st.column_config.NumberColumn("PnL ($)", format="%.2f"),
         },
     )
+
+    with st.spinner("Je reconstruis l'evolution du portefeuille..."):
+        portfolio_history = build_portfolio_performance_history(portfolio)
+    if not portfolio_history.empty:
+        st.plotly_chart(build_portfolio_performance_figure(portfolio_history), width="stretch")
+    else:
+        st.info("Le graphe d'evolution apparaitra des que l'historique de prix sera disponible.")
 
     action_col1, action_col2 = st.columns([2, 1])
     position_to_delete = action_col1.selectbox(
@@ -4288,73 +4722,6 @@ def render_market_today_section(catalog: pd.DataFrame) -> None:
                 st.caption(f"{item.get('ticker')} | {provider} | {published}")
 
 
-def render_news_email_controls(current_user: sqlite3.Row) -> None:
-    if current_user["role"] != "admin":
-        return
-
-    with st.expander("Envoyer un recap par email"):
-        default_recipients = os.getenv("NEWS_EMAIL_TO") or os.getenv("NEWS_EMAIL_RECIPIENTS") or ""
-        base_recipients = st.text_area(
-            "Destinataires par defaut",
-            value=default_recipients,
-            placeholder="email1@example.com, email2@example.com",
-            height=80,
-        )
-        extra_recipients = st.text_area(
-            "Ajouter d'autres destinataires pour cet envoi",
-            value="",
-            placeholder="autre@example.com, equipe@example.com",
-            height=80,
-        )
-        recipients = merge_email_recipient_values(base_recipients, extra_recipients)
-        recipient_count = len(split_email_recipients(recipients))
-        st.caption(f"Ce recap sera envoye a {recipient_count} destinataire(s).")
-
-        selected_categories = st.multiselect(
-            "Rubriques",
-            options=list(GENERAL_NEWS_FEEDS.keys()),
-            default=list(NEWS_RECAP_DEFAULT_CATEGORIES),
-        )
-        items_per_category = st.slider("Articles par rubrique", min_value=3, max_value=10, value=NEWS_RECAP_DEFAULT_LIMIT)
-        smtp_user = st.text_input(
-            "Compte SMTP",
-            value=os.getenv("NEWS_SMTP_USER") or os.getenv("GMAIL_USER") or "",
-            placeholder="adresse@gmail.com",
-        )
-        smtp_password = st.text_input(
-            "Mot de passe d'application SMTP",
-            value="",
-            type="password",
-            placeholder="Utilise .env pour ne pas le ressaisir",
-        )
-
-        config_preview = get_news_email_config(
-            recipients,
-            sender_override=smtp_user,
-            username_override=smtp_user,
-            password_override=smtp_password,
-        )
-        config_errors = validate_news_email_config(config_preview)
-        if config_errors:
-            st.warning("Configuration mail incomplete : " + " ".join(config_errors))
-
-        if st.button("Envoyer le recap maintenant", disabled=bool(config_errors), use_container_width=True):
-            with st.spinner("Envoi du recap en cours..."):
-                try:
-                    result = send_daily_news_recap_email(
-                        recipients_override=recipients,
-                        categories=selected_categories,
-                        items_per_category=items_per_category,
-                        sender_override=smtp_user,
-                        username_override=smtp_user,
-                        password_override=smtp_password,
-                    )
-                except Exception as exc:
-                    st.error(f"Impossible d'envoyer le recap : {exc}")
-                else:
-                    st.success(f"Recap envoye a {result['sent_count']} destinataire(s).")
-
-
 def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
     if current_user["role"] != "admin":
         return
@@ -4455,7 +4822,7 @@ def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
                 )
                 voice_instructions = instruction_col.text_input(
                     "Direction vocale",
-                    value="Voix francaise naturelle, rythme pose, ton briefing radio professionnel.",
+                    value="Voix francaise naturelle, rythme soutenu et dynamique, ton briefing radio professionnel.",
                     key="podcast_voice_instructions",
                 )
             else:
@@ -4500,6 +4867,86 @@ def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
             if audio_path.exists():
                 st.audio(str(audio_path))
                 st.caption(f"Fichier audio : {audio_path}")
+
+        if st.session_state.get("podcast_script"):
+            st.divider()
+            email_col, btn_col = st.columns([3, 1])
+            email_recipient = email_col.text_input(
+                "Envoyer le briefing par email",
+                value="rafik.mo1995@gmail.com",
+                label_visibility="visible",
+                key="briefing_email_recipient",
+            )
+            config_errors = validate_news_email_config(get_news_email_config(email_recipient))
+            if btn_col.button(
+                "Envoyer",
+                use_container_width=True,
+                disabled=bool(config_errors) or not email_recipient,
+                key="briefing_email_send",
+            ):
+                script_text = st.session_state.get("podcast_script", "")
+                subject = f"Briefing du {datetime.now().strftime('%d/%m/%Y')}"
+                html_body = "<pre style='font-family:sans-serif;white-space:pre-wrap'>" + script_text.replace("&", "&amp;").replace("<", "&lt;") + "</pre>"
+                with st.spinner("Envoi en cours..."):
+                    try:
+                        send_email_message(subject, script_text, html_body, recipients_override=email_recipient)
+                    except Exception as exc:
+                        st.error(f"Impossible d'envoyer : {exc}")
+                    else:
+                        st.success(f"Briefing envoye a {email_recipient}.")
+            if config_errors:
+                st.caption(f"SMTP non configure : {' '.join(config_errors)}")
+
+
+def render_briefing_email_schedule(current_user: sqlite3.Row) -> None:
+    if current_user["role"] != "admin":
+        return
+
+    schedule = get_email_schedule()
+
+    with st.expander("Envoi automatique du briefing par email"):
+        enabled = st.toggle("Activer l'envoi automatique", value=schedule["enabled"], key="bes_enabled")
+
+        hours = [f"{h:02d}:00" for h in range(6, 23)]
+        send_time = st.selectbox(
+            "Heure d'envoi",
+            options=hours,
+            index=hours.index(schedule["send_time"]) if schedule["send_time"] in hours else hours.index("08:00"),
+            key="bes_send_time",
+        )
+
+        st.caption("Destinataires")
+        current_recipients = list(schedule["recipients"])
+        to_remove = []
+        for i, r in enumerate(current_recipients):
+            col_email, col_del = st.columns([5, 1])
+            col_email.text(r)
+            if col_del.button("✕", key=f"bes_del_{i}"):
+                to_remove.append(r)
+        current_recipients = [r for r in current_recipients if r not in to_remove]
+
+        new_email = st.text_input("Ajouter un destinataire", placeholder="adresse@example.com", key="bes_new_email")
+        add_col, save_col = st.columns(2)
+        if add_col.button("Ajouter", key="bes_add", use_container_width=True):
+            if new_email and EMAIL_PATTERN.fullmatch(new_email.strip()):
+                if new_email.strip() not in current_recipients:
+                    current_recipients.append(new_email.strip())
+                save_email_schedule(enabled, current_recipients, send_time)
+                st.rerun()
+            else:
+                st.error("Adresse invalide.")
+
+        if save_col.button("Enregistrer", key="bes_save", use_container_width=True):
+            save_email_schedule(enabled, current_recipients, send_time)
+            st.success("Paramètres enregistrés.")
+
+        if schedule["last_sent_date"]:
+            st.caption(f"Dernier envoi : {schedule['last_sent_date']}")
+
+        st.caption(
+            "Activer le cron (une seule fois sur le serveur) :  \n"
+            "`* * * * * cd /root/Documents/streamlit_app && /root/Documents/streamlit_app/.venv/bin/python app.py send-briefing-email`"
+        )
 
 
 def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], current_user: sqlite3.Row) -> None:
@@ -4569,17 +5016,8 @@ def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], cu
         if st.button("Rafraichir les infos generales", key="refresh_general_news_button"):
             fetch_general_news.clear()
 
-        render_news_email_controls(current_user)
         render_podcast_briefing_controls(current_user)
-
-        with st.expander("Sources et methode"):
-            st.write(
-                "Je lis directement des flux RSS publics de medias d'information, puis j'affiche les articles les plus recents. "
-                "Chaque carte indique la source du media et le lien direct de l'article. "
-                "Si un flux ne repond pas, il est ignore pour ne pas bloquer la page."
-            )
-            for feed in GENERAL_NEWS_FEEDS[category]:
-                st.markdown(f"- `{feed['label']}` : {feed['url']}")
+        render_briefing_email_schedule(current_user)
 
         sort_col, source_col = st.columns(2)
         general_sort = sort_col.selectbox(
@@ -4618,7 +5056,6 @@ def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], cu
 def render_comparator_section(
     catalog: pd.DataFrame,
     asset_types: list[str],
-    selected_period_label: str,
     smooth_closures: bool,
     use_log_scale: bool,
 ) -> list[str]:
@@ -4631,7 +5068,10 @@ def render_comparator_section(
         return []
 
     default_labels = visible_catalog[visible_catalog["ticker"].isin(DEFAULT_TICKERS)]["label"].tolist()
-    selected_labels = st.multiselect(
+
+    col_period, col_search = st.columns([1, 4])
+    selected_period_label = col_period.selectbox("Durée", options=list(PERIOD_OPTIONS.keys()), index=4)
+    selected_labels = col_search.multiselect(
         "Recherche et comparaison",
         options=visible_catalog["label"].tolist(),
         default=default_labels,
@@ -4789,40 +5229,40 @@ def display_connection_logs() -> None:
         conn.close()
 
 
+_APP_PWD_TOKEN = "rafik_verified_v1"
+
+
 def check_password() -> bool:
-    """Vérifie le mot de passe simple."""
-    if "password_verified" not in st.session_state:
-        st.session_state.password_verified = False
-    
-    if st.session_state.password_verified:
+    if st.session_state.get("password_verified"):
         return True
-    
-    st.title("🔐 Accès Protégé")
-    st.write("Veuillez entrer le mot de passe pour accéder à l'application.")
-    
+
+    if st.query_params.get("_auth") == _APP_PWD_TOKEN:
+        st.session_state.password_verified = True
+        return True
+
+    st.title("Acces Protege")
     with st.form("password_form"):
         password = st.text_input("Mot de passe", type="password", key="password_input")
-        submitted = st.form_submit_button("Accéder")
-    
+        submitted = st.form_submit_button("Acceder")
+
     if submitted:
         if password == "rafik":
+            st.query_params["_auth"] = _APP_PWD_TOKEN
             st.session_state.password_verified = True
             st.rerun()
         else:
-            st.error("❌ Mot de passe incorrect!")
-    
+            st.error("Mot de passe incorrect.")
+
     return False
 
 
 def main() -> None:
-    # Vérifier le mot de passe en premier
+    init_user_db()
     if not check_password():
         return
-    
-    # Pas d'authentification requise - accès public
+
     render_auth_cookie_sync()
-    
-    # Créer un faux utilisateur pour éviter les erreurs
+
     current_user = {
         "username": "rafik",
         "display_name": "Rafik",
@@ -4835,29 +5275,12 @@ def main() -> None:
         st.error(reason)
         return
 
-    with st.sidebar:
-        st.header("Application")
-        st.caption("Mode public - Accès illimité")
-        st.divider()
-        st.header("Parametres")
-        refresh_catalog = st.button("Rafraichir actions / indices")
-        refresh_crypto = st.button("Rafraichir cryptos")
-        asset_types = st.multiselect(
-            "Types d'actifs visibles",
-            options=["Entreprise", "Indice", "ETF", "Crypto"],
-            default=["Entreprise", "Indice", "Crypto"],
-        )
-        selected_period_label = st.selectbox(
-            "Periode d'observation",
-            options=list(PERIOD_OPTIONS.keys()),
-            index=4,
-        )
-        smooth_closures = st.toggle(
-            "Lisser les fermetures de marche",
-            value=True,
-            help="Prolonge visuellement la derniere cotation connue pendant les fermetures pour eviter les cassures de courbe.",
-        )
-        use_log_scale = st.toggle("Echelle logarithmique sur le graphe prix", value=False)
+    # Parametres par defaut (sidebar supprimee pour epurer l'interface)
+    refresh_catalog = False
+    refresh_crypto = False
+    asset_types = ["Entreprise", "Indice", "Crypto"]
+    smooth_closures = True
+    use_log_scale = False
 
     try:
         cache_path = download_company_directory(force_refresh=refresh_catalog)
@@ -4887,7 +5310,6 @@ def main() -> None:
         comparison_tickers = render_comparator_section(
             catalog,
             asset_types,
-            selected_period_label,
             smooth_closures,
             use_log_scale,
         )
@@ -4917,16 +5339,70 @@ def main() -> None:
 
 
 def run_daily_news_email_command() -> int:
+    init_user_db()
+    schedule = get_email_schedule()
+    if not schedule["enabled"]:
+        print("Envoi automatique desactive. Rien a faire.")
+        return 0
     try:
-        result = send_daily_news_recap_email()
+        result = send_daily_news_recap_email(recipients_override=", ".join(schedule["recipients"]))
     except Exception as exc:
         print(f"Erreur envoi recap infos : {exc}", file=sys.stderr)
         return 1
-    print(f"Recap infos envoye a {result['sent_count']} destinataire(s).")
+    print(f"Recap infos envoye a {result['sent_count']} destinataire(s) ({schedule['recipients']}).")
     return 0
+
+
+def run_send_briefing_email_command() -> int:
+    init_user_db()
+    schedule = get_email_schedule()
+    if not schedule["enabled"]:
+        print("Envoi automatique briefing desactive.")
+        return 0
+
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    today = now.strftime("%Y-%m-%d")
+
+    if current_time != schedule["send_time"]:
+        return 0
+
+    if schedule["last_sent_date"] == today:
+        print(f"Briefing deja envoye aujourd'hui ({today}).")
+        return 0
+
+    recipients = schedule["recipients"]
+    if not recipients:
+        print("Aucun destinataire configure.", file=sys.stderr)
+        return 1
+
+    try:
+        categories = ["A la une", "Economie", "International"]
+        context = collect_podcast_briefing_context(None, categories, include_portfolio=False)
+        script, _ = generate_podcast_script(context, duration_minutes=5, tone="generaliste, clair, pose et professionnel")
+    except Exception as exc:
+        print(f"Erreur generation script : {exc}", file=sys.stderr)
+        return 1
+
+    subject = f"Briefing IA du {now.strftime('%d/%m/%Y')}"
+    html_body = "<pre style='font-family:sans-serif;white-space:pre-wrap'>" + script.replace("&", "&amp;").replace("<", "&lt;") + "</pre>"
+    errors = []
+    for recipient in recipients:
+        try:
+            send_email_message(subject, script, html_body, recipients_override=recipient)
+            print(f"Briefing envoye a {recipient}.")
+        except Exception as exc:
+            print(f"Erreur envoi a {recipient} : {exc}", file=sys.stderr)
+            errors.append(recipient)
+
+    if not errors:
+        mark_briefing_email_sent_today()
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "send-daily-news-email":
         raise SystemExit(run_daily_news_email_command())
+    if len(sys.argv) > 1 and sys.argv[1] == "send-briefing-email":
+        raise SystemExit(run_send_briefing_email_command())
     main()

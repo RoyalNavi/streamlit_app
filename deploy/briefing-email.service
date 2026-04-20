@@ -1,5 +1,5 @@
 [Unit]
-Description=Send daily news recap email
+Description=Send scheduled AI briefing email
 After=network-online.target
 Wants=network-online.target
 
@@ -9,4 +9,4 @@ User=root
 WorkingDirectory=/root/Documents/streamlit_app
 EnvironmentFile=-/root/Documents/streamlit_app/.env
 Environment=PATH=/root/Documents/streamlit_app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/root/Documents/streamlit_app/.venv/bin/python /root/Documents/streamlit_app/app.py send-daily-news-email
+ExecStart=/root/Documents/streamlit_app/.venv/bin/python /root/Documents/streamlit_app/app.py send-briefing-email
