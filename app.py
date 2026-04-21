@@ -33,6 +33,13 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from market_universe import (
+    europe_equities_frame,
+    infer_currency,
+    infer_market_region,
+    infer_market_session,
+)
+
 try:
     import yfinance as yf
 except ImportError:  # pragma: no cover - optional dependency at runtime
@@ -143,7 +150,7 @@ PERIOD_OPTIONS = {
     "Maximum": {"period": "max", "interval": "1mo"},
 }
 
-DEFAULT_TICKERS = ["^FCHI", "^GDAXI", "^GSPC", "URTH", "^IXIC"]
+DEFAULT_TICKERS = ["^GSPC", "^GDAXI", "NVDA", "META", "MSFT", "^FCHI"]
 OTHER_EXCHANGE_NAMES = {
     "A": "NYSE American",
     "N": "NYSE",
@@ -218,6 +225,11 @@ PODCAST_DEFAULT_DURATION_MINUTES = 10
 PODCAST_DURATION_OPTIONS = [3, 5, 10]
 PODCAST_TTS_MODEL = "gpt-4o-mini-tts"
 PODCAST_SCRIPT_MODEL = os.getenv("OPENAI_SCRIPT_MODEL", "gpt-4o-mini")
+NEWS_DIGEST_CACHE_KEY = "daily_news_digest"
+EDITORIAL_STATE_CACHE_KEY = "editorial_state"
+NEWS_DIGEST_DEBUG_CACHE_KEY = "news_digest_debug"
+NEWS_DIGEST_REUSE_MINUTES = 60
+NEWS_DIGEST_MAIN_SWITCH_MARGIN = 18.0
 
 
 def load_local_env_file(env_path: Path | None = None) -> None:
@@ -1570,7 +1582,11 @@ def parse_nasdaq_directory(payload: str) -> pd.DataFrame:
     frame["name"] = frame["name"].astype(str).str.strip()
     frame["exchange"] = "Nasdaq"
     frame["asset_type"] = frame["ETF"].map({"Y": "ETF", "N": "Entreprise"}).fillna("Entreprise")
-    return frame[["ticker", "name", "exchange", "asset_type"]]
+    frame["region"] = "US"
+    frame["market_region"] = "US"
+    frame["country"] = "United States"
+    frame["currency"] = "USD"
+    return frame[["ticker", "name", "exchange", "asset_type", "region", "market_region", "country", "currency"]]
 
 
 def parse_other_listed_directory(payload: str) -> pd.DataFrame:
@@ -1583,7 +1599,11 @@ def parse_other_listed_directory(payload: str) -> pd.DataFrame:
     frame["name"] = frame["name"].astype(str).str.strip()
     frame["exchange"] = frame["Exchange"].map(OTHER_EXCHANGE_NAMES).fillna(frame["Exchange"])
     frame["asset_type"] = frame["ETF"].map({"Y": "ETF", "N": "Entreprise"}).fillna("Entreprise")
-    return frame[["ticker", "name", "exchange", "asset_type"]]
+    frame["region"] = "US"
+    frame["market_region"] = "US"
+    frame["country"] = "United States"
+    frame["currency"] = "USD"
+    return frame[["ticker", "name", "exchange", "asset_type", "region", "market_region", "country", "currency"]]
 
 
 def download_crypto_directory(force_refresh: bool = False) -> Path:
@@ -1615,6 +1635,10 @@ def download_crypto_directory(force_refresh: bool = False) -> Path:
                     "name": item["name"],
                     "exchange": "Crypto",
                     "asset_type": "Crypto",
+                    "region": "Crypto",
+                    "market_region": "Crypto",
+                    "country": "Crypto",
+                    "currency": "USD",
                 }
                 for item in payload
             ]
@@ -1663,25 +1687,43 @@ def load_symbol_catalog(cache_marker: float) -> pd.DataFrame:
     _ = cache_marker
     companies = pd.read_csv(MARKET_CACHE_PATH)
     companies["cik"] = ""
-    companies["region"] = "US"
+    companies["region"] = companies.get("region", "US")
+    companies["market_region"] = companies.get("market_region", "US")
+    companies["country"] = companies.get("country", "United States")
+    companies["currency"] = companies.get("currency", "USD")
 
     cryptos = pd.read_csv(CRYPTO_CACHE_PATH)
     cryptos["cik"] = ""
-    cryptos["region"] = "Crypto"
+    cryptos["region"] = cryptos.get("region", "Crypto")
+    cryptos["market_region"] = cryptos.get("market_region", "Crypto")
+    cryptos["country"] = cryptos.get("country", "Crypto")
+    cryptos["currency"] = cryptos.get("currency", "USD")
 
     indices = pd.DataFrame(MAJOR_INDICES)
     indices["cik"] = ""
     indices["region"] = "Global"
+    indices["market_region"] = "Global"
+    indices["country"] = "Global"
+    indices["currency"] = "Mixed"
 
-    euro_stocks = pd.DataFrame(EUROPE_LEADERS)
+    euro_stocks = europe_equities_frame()
     euro_stocks["cik"] = ""
-    euro_stocks["region"] = "Europe"
 
     catalog = pd.concat([companies, indices, cryptos, euro_stocks], ignore_index=True, sort=False)
     catalog["ticker"] = catalog["ticker"].astype(str).str.strip().str.upper()
     catalog["name"] = catalog["name"].astype(str).str.strip()
     catalog["exchange"] = catalog["exchange"].fillna("")
     catalog["asset_type"] = catalog["asset_type"].fillna("Entreprise")
+    catalog["region"] = catalog["region"].fillna(catalog["asset_type"]).astype(str)
+    catalog["market_region"] = catalog.apply(
+        lambda row: row.get("market_region") or infer_market_region(row["ticker"], row.get("asset_type")),
+        axis=1,
+    )
+    catalog["country"] = catalog.get("country", "").fillna("")
+    catalog["currency"] = catalog.apply(
+        lambda row: row.get("currency") or infer_currency(row["ticker"], default="USD"),
+        axis=1,
+    )
     catalog["label"] = catalog.apply(
         lambda row: f"[{row['region']}] {row['name']} ({row['ticker']}) - {row['exchange'] or row['asset_type']}",
         axis=1,
@@ -1725,11 +1767,15 @@ def extract_history_series(
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def download_price_histories(tickers: tuple[str, ...], period: str, interval: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def download_price_histories(
+    tickers: tuple[str, ...],
+    period: str,
+    interval: str,
+    include_prepost: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if yf is None:
         raise RuntimeError("yfinance n'est pas disponible.")
 
-    # prepost=True permet de capturer les mouvements hors-séance (Pre-market/After-hours)
     raw = yf.download(
         tickers=list(tickers),
         period=period,
@@ -1739,7 +1785,7 @@ def download_price_histories(tickers: tuple[str, ...], period: str, interval: st
         threads=True,
         group_by="ticker",
         multi_level_index=True,
-        prepost=True,
+        prepost=include_prepost,
     )
     if raw.empty:
         raise ValueError("Aucune donnee de marche n'a ete renvoyee.")
@@ -1947,6 +1993,138 @@ def fetch_midcap_recommendations(limit: int = 8) -> pd.DataFrame:
     return fetch_stock_ideas("Mid (2-10B)", limit)
 
 
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"oui", "true", "1", "yes"}
+    return bool(value)
+
+
+def _text_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    text = str(value).strip()
+    if not text or text == "-":
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def recommendation_signal_label(row: pd.Series) -> str:
+    confirmed = _as_bool(row.get("Confirmed"))
+    score = _as_float(row.get("Score"))
+    age_penalty = _as_float(row.get("Age_Penalty"))
+    signal_age = _as_float(row.get("Signal_Age_Minutes"))
+    new_observation = _as_bool(row.get("new_observation"))
+    consecutive_hits = int(_as_float(row.get("Consecutive_Hits")))
+
+    if age_penalty >= 0.8 or signal_age > 1440:
+        return "Trop ancien"
+    if confirmed:
+        return "Confirmé"
+    if new_observation and consecutive_hits <= 1 and score >= 4.0:
+        return "Récent"
+    if score >= 4.2:
+        return "À surveiller"
+    return "Faible"
+
+
+def recommendation_opportunity_label(row: pd.Series) -> str:
+    timing = _as_float(row.get("Opportunity_Adjustment"))
+    score = _as_float(row.get("Score"))
+    rsi = _as_float(row.get("RSI"), default=50.0)
+    distance = _as_float(row.get("Distance_MA20 (%)"))
+
+    if timing >= 1.0 and score >= 4.8 and rsi <= 70 and distance <= 10:
+        return "Très bonne"
+    if timing >= 0 and score >= 4.2 and rsi <= 75 and distance <= 15:
+        return "Correcte"
+    if timing > -1.0:
+        return "Moyenne"
+    return "Faible"
+
+
+def recommendation_risk_label(row: pd.Series) -> str:
+    flags = " ".join(_text_list(row.get("risk_flags"))).lower()
+    rsi = _as_float(row.get("RSI"), default=50.0)
+    distance = _as_float(row.get("Distance_MA20 (%)"))
+    age_penalty = _as_float(row.get("Age_Penalty"))
+    high_terms = ("etire", "très eleve", "tres eleve", "earnings dans 0 a 3 jours", "breakout non confirme")
+    medium_terms = ("rsi", "extension", "earnings", "ma20", "relative")
+
+    if any(term in flags for term in high_terms) or rsi > 75 or distance > 15 or age_penalty >= 0.8:
+        return "Élevé"
+    if flags or any(term in flags for term in medium_terms) or rsi > 70 or distance > 10 or age_penalty > 0:
+        return "Moyen"
+    return "Faible"
+
+
+def recommendation_verdict(row: pd.Series) -> str:
+    confirmed = _as_bool(row.get("Confirmed"))
+    signal = row.get("Signal") or recommendation_signal_label(row)
+    opportunity = row.get("Opportunité") or recommendation_opportunity_label(row)
+    risk = row.get("Risque") or recommendation_risk_label(row)
+    rsi = _as_float(row.get("RSI"), default=50.0)
+    distance = _as_float(row.get("Distance_MA20 (%)"))
+    flags = " ".join(_text_list(row.get("risk_flags"))).lower()
+
+    too_stretched = rsi > 75 or distance > 15 or "etire" in flags or "extension" in flags
+    if too_stretched and confirmed:
+        return "Confirmé mais tendu"
+    if too_stretched:
+        return "Trop tendu"
+    if confirmed and opportunity in {"Très bonne", "Correcte"} and risk != "Élevé":
+        return "Meilleure opportunité"
+    if signal in {"Récent", "À surveiller"} or (_as_float(row.get("Score")) >= 4.2 and not confirmed):
+        return "À surveiller"
+    return "Écarter"
+
+
+def build_recommendation_display_frame(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for col in ("why_selected", "risk_flags"):
+        if col in df.columns:
+            df[col] = df[col].apply(lambda values: ", ".join(values) if isinstance(values, list) else (values or "-"))
+    df["Action"] = df.apply(lambda row: f"{row.get('Nom', '-') } ({row.get('Ticker', '-')})", axis=1)
+    df["Signal"] = df.apply(recommendation_signal_label, axis=1)
+    df["Opportunité"] = df.apply(recommendation_opportunity_label, axis=1)
+    df["Risque"] = df.apply(recommendation_risk_label, axis=1)
+    df["Verdict"] = df.apply(recommendation_verdict, axis=1)
+    df["Pourquoi"] = df.apply(
+        lambda row: ", ".join(_text_list(row.get("why_selected") or row.get("Signaux"))[:3]) or "-",
+        axis=1,
+    )
+    verdict_rank = {
+        "Meilleure opportunité": 0,
+        "Confirmé mais tendu": 1,
+        "À surveiller": 2,
+        "Trop tendu": 3,
+        "Écarter": 4,
+    }
+    opportunity_rank = {"Très bonne": 0, "Correcte": 1, "Moyenne": 2, "Faible": 3}
+    risk_rank = {"Faible": 0, "Moyen": 1, "Élevé": 2}
+    df["_verdict_rank"] = df["Verdict"].map(verdict_rank).fillna(9)
+    df["_opportunity_rank"] = df["Opportunité"].map(opportunity_rank).fillna(9)
+    df["_risk_rank"] = df["Risque"].map(risk_rank).fillna(9)
+    df["_confirmed_sort"] = df.get("Confirmed", False).apply(lambda value: 0 if _as_bool(value) else 1)
+    df["_score_sort"] = df.get("Score", 0).apply(_as_float)
+    return df.sort_values(
+        ["_verdict_rank", "_confirmed_sort", "_opportunity_rank", "_risk_rank", "_score_sort"],
+        ascending=[True, True, True, True, False],
+    ).reset_index(drop=True)
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_news_headlines(ticker: str) -> list[str]:
     if yf is None:
@@ -2004,10 +2182,52 @@ def analyze_stocks_with_ai(rows: list[dict], api_key: str) -> dict:
         return {}
 
 
-def render_midcap_recommendations_section() -> None:
-    from cache import read_cache, cache_freshness_label, cache_age_minutes
+def render_news_llm_actions(df: pd.DataFrame, *, engine: str) -> None:
+    from news_context import fetch_yahoo_news, summarize_news_with_llm_cached
 
-    st.subheader("Valeurs a fort potentiel")
+    api_key = get_openai_api_key()
+    ticker_col = "Ticker" if "Ticker" in df.columns else "ticker"
+    name_col = "Nom" if "Nom" in df.columns else "name"
+    if ticker_col not in df.columns:
+        return
+
+    st.caption("Contexte IA a la demande : aucun appel LLM n'est lance tant que tu ne cliques pas sur un ticker.")
+    rows = df.head(10).to_dict("records")
+    for row in rows:
+        ticker = str(row.get(ticker_col) or "").upper()
+        if not ticker:
+            continue
+        label = row.get("context_label") or "Contexte non calcule"
+        name = row.get(name_col) or ticker
+        result_key = f"news_llm_result_{engine}_{ticker}"
+        c1, c2, c3 = st.columns([1.2, 2.6, 1.2])
+        c1.markdown(f"**{ticker}**")
+        c2.caption(f"{name} · {label}")
+        clicked = c3.button("Résumé IA", key=f"news_llm_btn_{engine}_{ticker}", use_container_width=True)
+        if clicked:
+            if not api_key:
+                st.session_state[result_key] = {
+                    "summary": "Cle OpenAI absente : impossible de generer le resume IA.",
+                    "cached": False,
+                }
+            else:
+                try:
+                    news_items = fetch_yahoo_news(ticker, limit=5)
+                    result = summarize_news_with_llm_cached(ticker, news_items, api_key)
+                    st.session_state[result_key] = result
+                except Exception as exc:
+                    st.session_state[result_key] = {
+                        "summary": f"Resume IA indisponible : {exc}",
+                        "cached": False,
+                    }
+        result = st.session_state.get(result_key)
+        if result:
+            cache_note = "cache" if result.get("cached") else "nouveau"
+            st.info(f"{ticker} · {cache_note} · {result.get('summary', '')}")
+
+
+def render_stable_recommendations_section() -> None:
+    from cache import read_cache, cache_freshness_label, cache_age_minutes
 
     # ---- Lecture du cache worker ----
     cached = read_cache("stock_ideas")
@@ -2020,8 +2240,10 @@ def render_midcap_recommendations_section() -> None:
         if age < 35:
             st.caption(
                 f"🟢 Worker actif — analyse mise a jour {cache_freshness_label('stock_ideas')} "
-                f"· univers journalier {meta.get('universe_date', '-')} "
-                f"({meta.get('universe_size', '?')} tickers) · "
+                f"· univers {meta.get('universe_date', '-')} "
+                f"surveille {meta.get('monitored_universe_size') or meta.get('universe_size', '?')} "
+                f"· shortlist {meta.get('scoring_shortlist_size') or meta.get('universe_size', '?')} "
+                f"· scores {meta.get('scored_count', '?')} · "
                 f"{meta.get('confirmed_count', 0)} signal(s) confirme(s)"
             )
         elif age < 90:
@@ -2050,14 +2272,14 @@ def render_midcap_recommendations_section() -> None:
         st.info("Aucune valeur disponible pour le moment.")
         return
 
-    # ---- Filtre segment ----
+    # ---- Filtres ----
     cap_limits = {
         "Tout": (0, float("inf")),
         "Small (<2B)": (0, 2e9),
         "Mid (2-10B)": (2e9, 10e9),
         "Large (>10B)": (10e9, float("inf")),
     }
-    filter_col, setup_col, confirm_col = st.columns([2, 2, 2])
+    filter_col, setup_col, view_col, mode_col = st.columns([1.4, 1.4, 1.8, 1.2])
     cap_filter = filter_col.selectbox("Segment", options=list(cap_limits.keys()), index=0, key="stock_ideas_cap_filter")
     setup_filter = setup_col.selectbox(
         "Setup",
@@ -2065,35 +2287,56 @@ def render_midcap_recommendations_section() -> None:
         index=0,
         key="stock_ideas_setup_filter",
     )
-    confirmed_only = confirm_col.toggle("Signaux confirmes", value=False, key="stock_ideas_confirmed_only")
+    view_filter = view_col.selectbox(
+        "Vue",
+        options=["Tout", "Meilleures opportunités", "Confirmés", "À surveiller", "Trop tendus"],
+        index=0,
+        key="stock_ideas_view_filter",
+    )
+    advanced_mode = mode_col.toggle("Mode avancé", value=False, key="stock_ideas_advanced_mode")
     cap_min, cap_max = cap_limits[cap_filter]
     rows = [r for r in all_rows if cap_min <= r.get("cap_raw", r.get("_market_cap_raw", 0)) < cap_max]
     if setup_filter != "Tous":
         rows = [r for r in rows if r.get("Setup_Type") == setup_filter]
-    if confirmed_only:
-        rows = [r for r in rows if bool(r.get("Confirmed"))]
     if not rows:
         st.info("Aucune valeur pour cette selection.")
         return
 
-    df = pd.DataFrame(rows[:15])
-    for col in ("why_selected", "risk_flags"):
-        if col in df.columns:
-            df[col] = df[col].apply(lambda values: ", ".join(values) if isinstance(values, list) else (values or "-"))
+    df = build_recommendation_display_frame(rows)
+    if view_filter == "Meilleures opportunités":
+        df = df[df["Verdict"] == "Meilleure opportunité"]
+    elif view_filter == "Confirmés":
+        df = df[df["Confirmed"].apply(_as_bool)]
+    elif view_filter == "À surveiller":
+        df = df[df["Verdict"] == "À surveiller"]
+    elif view_filter == "Trop tendus":
+        df = df[df["Verdict"].isin(["Trop tendu", "Confirmé mais tendu"])]
+
+    if df.empty:
+        st.info("Aucune valeur pour cette selection.")
+        return
+
+    df = df.head(15).copy()
     if "Confirmed" in df.columns:
-        df["Confirmed"] = df["Confirmed"].map(lambda value: "Oui" if bool(value) else "Non")
+        df["Confirmed"] = df["Confirmed"].map(lambda value: "Oui" if _as_bool(value) else "Non")
+    if "new_observation" in df.columns:
+        df["new_observation"] = df["new_observation"].map(lambda value: "Oui" if _as_bool(value) else "Non")
 
     # Colonnes enrichies si disponibles (cache worker), basiques sinon
-    if using_cache:
+    if using_cache and advanced_mode:
         show_cols = [
             "Display_Rank", "Nom", "Ticker", "Setup_Type", "Confirmed", "Score",
-            "Stability_Score", "Consecutive_Hits", "Signal_Age_Minutes",
+            "Opportunity_Adjustment", "Raw_Score", "Age_Penalty",
+            "market_region", "market_session", "new_observation", "last_market_timestamp",
+            "Stability_Score", "Consecutive_Hits", "Recent_Top_Hits", "Signal_Age_Minutes",
             "Cours", "Variation (%)", "Capitalisation", "RSI", "MACD",
-            "RS_SPY_1m (%)", "Distance_MA20 (%)", "Earnings",
-            "why_selected", "risk_flags",
+            "RS_SPY_1m (%)", "RS_SPY_3m (%)", "Distance_MA20 (%)", "Earnings",
+            "context_label", "why_selected", "risk_flags",
         ]
+    elif using_cache:
+        show_cols = ["Display_Rank", "Action", "Setup_Type", "Signal", "Opportunité", "Variation (%)", "Risque", "context_label", "Pourquoi", "Verdict"]
     else:
-        show_cols = ["Nom", "Ticker", "Cours", "Variation (%)", "Capitalisation", "Score", "Signaux"]
+        show_cols = ["Action", "Variation (%)", "Score", "Signal", "Pourquoi"]
 
     display_cols = [c for c in show_cols if c in df.columns]
 
@@ -2104,6 +2347,9 @@ def render_midcap_recommendations_section() -> None:
         column_config={
             "Display_Rank": st.column_config.NumberColumn("#", format="%d"),
             "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=10, format="%.1f"),
+            "Raw_Score": st.column_config.NumberColumn("Score brut", format="%.1f"),
+            "Opportunity_Adjustment": st.column_config.NumberColumn("Timing", format="%+.1f"),
+            "Age_Penalty": st.column_config.NumberColumn("Malus age", format="%.2f"),
             "Stability_Score": st.column_config.ProgressColumn("Stabilite", min_value=0, max_value=100, format="%.0f"),
             "Consecutive_Hits": st.column_config.NumberColumn("Cycles", format="%d"),
             "Signal_Age_Minutes": st.column_config.NumberColumn("Age signal (min)", format="%.0f"),
@@ -2113,42 +2359,257 @@ def render_midcap_recommendations_section() -> None:
             "RSI": st.column_config.NumberColumn("RSI", format="%.0f"),
             "Setup_Type": st.column_config.TextColumn("Setup"),
             "Confirmed": st.column_config.TextColumn("Confirme"),
+            "market_region": st.column_config.TextColumn("Region"),
+            "market_session": st.column_config.TextColumn("Session"),
+            "new_observation": st.column_config.TextColumn("Nouv. obs."),
+            "last_market_timestamp": st.column_config.TextColumn("Derniere bougie"),
+            "context_label": st.column_config.TextColumn("Contexte news"),
             "why_selected": st.column_config.TextColumn("Pourquoi"),
             "risk_flags": st.column_config.TextColumn("Risques"),
+            "Action": st.column_config.TextColumn("Action"),
+            "Signal": st.column_config.TextColumn("Signal"),
+            "Opportunité": st.column_config.TextColumn("Opportunité"),
+            "Risque": st.column_config.TextColumn("Risque"),
+            "Pourquoi": st.column_config.TextColumn("Pourquoi"),
+            "Verdict": st.column_config.TextColumn("Verdict"),
         },
     )
 
     if using_cache and meta:
         setup_counts = meta.get("setup_counts") or {}
+        region_counts = meta.get("region_counts") or {}
+        monitored_regions = meta.get("monitored_region_counts") or {}
         st.caption(
             "Repartition setups : "
             + ", ".join(f"{name}: {count}" for name, count in setup_counts.items())
+            + (
+                " · regions : " + ", ".join(f"{name}: {count}" for name, count in region_counts.items())
+                if region_counts else ""
+            )
+            + (
+                " · surveilles : " + ", ".join(f"{name}: {count}" for name, count in monitored_regions.items())
+                if monitored_regions else ""
+            )
             + f" · seuil confirmation {meta.get('confirm_threshold', '-')}/10 sur {meta.get('confirm_cycles', '-')} cycles"
+            + f" · nouvelles observations {meta.get('new_observation_count', '-')}"
+            + " · cycles confirmes uniquement sur nouvelle observation de marche"
         )
 
-    # ---- Analyse IA ----
-    api_key = get_openai_api_key()
-    if api_key:
-        if st.button("Analyser avec l'IA (news + sentiment)", key="stock_ideas_ai_btn", use_container_width=True):
-            with st.spinner("Je recupere les news et j'analyse avec GPT-4o-mini..."):
-                ai_results = analyze_stocks_with_ai(df[display_cols].to_dict("records"), api_key)
-                st.session_state["stock_ideas_ai"] = ai_results
-                st.session_state["stock_ideas_ai_tickers"] = list(df["Ticker"])
+    render_news_llm_actions(df, engine="standard")
 
-    ai_results = st.session_state.get("stock_ideas_ai", {})
-    if ai_results and set(st.session_state.get("stock_ideas_ai_tickers", [])) & set(df["Ticker"]):
-        st.divider()
-        st.caption("Analyse IA — basee sur les dernieres actu Yahoo Finance")
-        for _, row in df.iterrows():
-            ticker = row["Ticker"]
-            analysis = ai_results.get(ticker)
-            if not analysis:
-                continue
-            c1, c2, c3, c4 = st.columns([1, 2, 2, 4])
-            c1.markdown(f"**{analysis.get('sentiment','🟡')} {ticker}**")
-            c2.caption(f"Catalyseur : {analysis.get('catalyseur','-')}")
-            c3.caption(f"Risque : {analysis.get('risque','-')}")
-            c4.write(analysis.get("commentaire", ""))
+
+def build_smallcap_display_frame(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["Action"] = df.apply(
+        lambda row: f"{row.get('name', '-') } ({row.get('ticker', '-')})",
+        axis=1,
+    )
+    df["Tags"] = df.get("tags", pd.Series([[]] * len(df))).apply(
+        lambda values: ", ".join(values) if isinstance(values, list) and values else "-"
+    )
+    df["Market Cap"] = df["market_cap"].map(format_money) if "market_cap" in df.columns else "-"
+    df["Volume affiche"] = df["volume"].map(format_large_number) if "volume" in df.columns else "-"
+    df["Avg vol 20j"] = df["avg_volume_20d"].map(format_large_number) if "avg_volume_20d" in df.columns else "-"
+    return df
+
+
+def render_smallcap_opportunities_section() -> None:
+    from cache import read_cache, cache_freshness_label, cache_age_minutes
+
+    cached = read_cache("smallcap_ideas")
+    cached_meta = read_cache("smallcap_ideas_meta")
+    meta = cached_meta.get("data", {}) if cached_meta else {}
+
+    if not cached or not cached.get("data"):
+        st.info(
+            "Aucune small cap explosive en cache pour le moment. "
+            "Le worker remplira `data/cache/smallcap_ideas.json` au prochain passage."
+        )
+        return
+
+    age = cache_age_minutes("smallcap_ideas") or 0
+    if age < 30:
+        st.caption(
+            f"Scanner small caps actif — mise a jour {cache_freshness_label('smallcap_ideas')} "
+            f"· candidats {meta.get('candidate_count', '?')} "
+            f"· scores {meta.get('scored_count', '?')} "
+            f"· duree {meta.get('duration_seconds', '?')}s"
+        )
+    elif age < 90:
+        st.warning(f"Dernier scan small caps il y a {int(age)} min — donnees a rafraichir.")
+    else:
+        st.error(
+            f"Scan small caps ancien ({cache_freshness_label('smallcap_ideas')}). "
+            "Verifier le worker si cela persiste."
+        )
+
+    rows = cached.get("data") or []
+    df = build_smallcap_display_frame(rows)
+    if df.empty:
+        st.info("Aucune small cap explosive exploitable pour le moment.")
+        return
+
+    risk_options = ["Tous"] + sorted(str(value) for value in df.get("risk", pd.Series(dtype=str)).dropna().unique())
+    setup_options = ["Tous"] + sorted(str(value) for value in df.get("setup", pd.Series(dtype=str)).dropna().unique())
+    tag_options = ["Tous", "first_move", "continuation", "overextended", "news_candidate", "gap_up"]
+
+    score_col, risk_col, setup_col, tag_col = st.columns([1.1, 1.2, 1.5, 1.3])
+    min_score = score_col.slider(
+        "Score min",
+        min_value=0.0,
+        max_value=10.0,
+        value=4.0,
+        step=0.5,
+        key="smallcap_min_score",
+    )
+    risk_filter = risk_col.selectbox("Risque", risk_options, index=0, key="smallcap_risk_filter")
+    setup_filter = setup_col.selectbox("Setup", setup_options, index=0, key="smallcap_setup_filter")
+    tag_filter = tag_col.selectbox("Tag", tag_options, index=0, key="smallcap_tag_filter")
+
+    df = df[df["Explosion_Score"].apply(_as_float) >= min_score]
+    if risk_filter != "Tous":
+        df = df[df["risk"] == risk_filter]
+    if setup_filter != "Tous":
+        df = df[df["setup"] == setup_filter]
+    if tag_filter != "Tous":
+        df = df[df["Tags"].str.contains(tag_filter, na=False)]
+
+    if df.empty:
+        st.info("Aucune small cap pour cette selection.")
+        return
+
+    show_cols = [
+        "rank", "Action", "price", "change_pct", "rel_volume", "Explosion_Score",
+        "setup", "risk", "context_label", "comment", "Tags", "last_market_timestamp",
+    ]
+    advanced = st.toggle("Details techniques small caps", value=False, key="smallcap_advanced")
+    if advanced:
+        show_cols = [
+            "rank", "ticker", "name", "price", "change_pct", "Market Cap", "Volume affiche",
+            "Avg vol 20j", "rel_volume", "Explosion_Score", "rsi_14",
+            "distance_from_ma20_pct", "close_vs_day_high", "volatility",
+            "setup", "risk", "comment", "Tags", "market_session", "last_market_timestamp",
+            "last_observed_price", "context_label",
+        ]
+    display_cols = [col for col in show_cols if col in df.columns]
+
+    st.dataframe(
+        df[display_cols].head(30),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "rank": st.column_config.NumberColumn("#", format="%d"),
+            "Action": st.column_config.TextColumn("Action"),
+            "ticker": st.column_config.TextColumn("Ticker"),
+            "name": st.column_config.TextColumn("Nom"),
+            "price": st.column_config.NumberColumn("Prix", format="%.2f"),
+            "change_pct": st.column_config.NumberColumn("Variation", format="%+.2f%%"),
+            "rel_volume": st.column_config.NumberColumn("Volume relatif", format="x%.2f"),
+            "Explosion_Score": st.column_config.ProgressColumn("Explosion", min_value=0, max_value=10, format="%.1f"),
+            "setup": st.column_config.TextColumn("Setup"),
+            "risk": st.column_config.TextColumn("Risque"),
+            "context_label": st.column_config.TextColumn("Contexte news"),
+            "comment": st.column_config.TextColumn("Commentaire"),
+            "Tags": st.column_config.TextColumn("Tags"),
+            "last_market_timestamp": st.column_config.TextColumn("Derniere bougie"),
+            "Market Cap": st.column_config.TextColumn("Capitalisation"),
+            "Volume affiche": st.column_config.TextColumn("Volume"),
+            "Avg vol 20j": st.column_config.TextColumn("Vol. moy. 20j"),
+            "rsi_14": st.column_config.NumberColumn("RSI 14", format="%.1f"),
+            "distance_from_ma20_pct": st.column_config.NumberColumn("Dist. MA20", format="%+.1f%%"),
+            "close_vs_day_high": st.column_config.NumberColumn("Close / high", format="%.3f"),
+            "volatility": st.column_config.NumberColumn("Volatilite", format="%.1f%%"),
+            "market_session": st.column_config.TextColumn("Session"),
+            "last_observed_price": st.column_config.NumberColumn("Dernier prix obs.", format="%.2f"),
+        },
+    )
+    render_news_llm_actions(df, engine="smallcap")
+
+    filters = meta.get("filters") or {}
+    if filters:
+        st.caption(
+            "Univers small caps US : "
+            f"prix {filters.get('min_price', '-')}-{filters.get('max_price', '-')}$ "
+            f"· cap max {format_money(filters.get('max_market_cap'))} "
+            f"· volume moyen min {format_large_number(filters.get('min_avg_volume'))}. "
+            "Ce moteur assume RSI eleve, extension et absence de stabilite multi-cycles."
+        )
+
+
+def render_midcap_recommendations_section() -> None:
+    st.subheader("Valeurs a fort potentiel")
+    stable_tab, smallcap_tab = st.tabs(["Signaux stables", "Small caps explosives"])
+    with stable_tab:
+        st.caption("Moteur principal : signaux plus propres, confirmes et suivables.")
+        render_stable_recommendations_section()
+    with smallcap_tab:
+        st.caption("Moteur agressif : momentum court terme, breakout, volume spike et risque eleve.")
+        render_smallcap_opportunities_section()
+    st.divider()
+    render_signal_tracking_summary()
+
+
+def render_signal_tracking_summary() -> None:
+    from signal_tracking import summarize_signal_outcomes
+
+    st.subheader("Suivi des signaux")
+    try:
+        summary = summarize_signal_outcomes(since_days=90)
+    except Exception as exc:
+        st.info(f"Suivi indisponible pour le moment : {exc}")
+        return
+
+    engine_rows = summary.get("by_engine") or []
+    if not engine_rows:
+        st.info("Aucun signal suivi pour le moment. Le worker remplira les statistiques au fil des prochains runs.")
+        return
+
+    metrics_df = pd.DataFrame(engine_rows)
+    label_map = {"standard": "Signaux stables", "smallcap": "Small caps explosives"}
+    metrics_df["Moteur"] = metrics_df["engine"].map(label_map).fillna(metrics_df["engine"])
+    display_cols = [
+        "Moteur", "total", "complete", "avg_1d", "avg_3d", "avg_5d",
+        "win_1d", "win_3d", "win_5d", "avg_runup", "avg_drawdown",
+    ]
+    display_cols = [col for col in display_cols if col in metrics_df.columns]
+    st.dataframe(
+        metrics_df[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "total": st.column_config.NumberColumn("Signaux suivis", format="%d"),
+            "complete": st.column_config.NumberColumn("Complets", format="%d"),
+            "avg_1d": st.column_config.NumberColumn("Perf moy. J+1", format="%+.2f%%"),
+            "avg_3d": st.column_config.NumberColumn("Perf moy. J+3", format="%+.2f%%"),
+            "avg_5d": st.column_config.NumberColumn("Perf moy. J+5", format="%+.2f%%"),
+            "win_1d": st.column_config.NumberColumn("Taux + J+1", format="%.1f%%"),
+            "win_3d": st.column_config.NumberColumn("Taux + J+3", format="%.1f%%"),
+            "win_5d": st.column_config.NumberColumn("Taux + J+5", format="%.1f%%"),
+            "avg_runup": st.column_config.NumberColumn("Run-up moy.", format="%+.2f%%"),
+            "avg_drawdown": st.column_config.NumberColumn("Drawdown moy.", format="%+.2f%%"),
+        },
+    )
+
+    setup_rows = summary.get("top_setups") or []
+    if setup_rows:
+        setup_df = pd.DataFrame(setup_rows)
+        setup_df["Moteur"] = setup_df["engine"].map(label_map).fillna(setup_df["engine"])
+        st.caption("Meilleurs setups recents avec performance J+5 disponible")
+        st.dataframe(
+            setup_df[["Moteur", "setup", "total", "avg_5d", "win_5d", "avg_runup"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "setup": st.column_config.TextColumn("Setup"),
+                "total": st.column_config.NumberColumn("Signaux", format="%d"),
+                "avg_5d": st.column_config.NumberColumn("Perf moy. J+5", format="%+.2f%%"),
+                "win_5d": st.column_config.NumberColumn("Taux + J+5", format="%.1f%%"),
+                "avg_runup": st.column_config.NumberColumn("Run-up moy.", format="%+.2f%%"),
+            },
+        )
 
 
 def render_market_movers_section(catalog: pd.DataFrame) -> None:
@@ -2927,6 +3388,46 @@ FRENCH_STOPWORDS = {
     "fait",
     "faire",
     "selon",
+    "vers",
+    "face",
+    "dont",
+    "etre",
+    "ete",
+    "sans",
+    "apres",
+    "pendant",
+}
+
+
+SOURCE_QUALITY_WEIGHTS = {
+    "Le Monde": 1.2,
+    "Les Echos": 1.2,
+    "Franceinfo": 1.1,
+    "France 24": 1.1,
+    "RFI": 1.05,
+    "Le Figaro": 1.0,
+    "BFMTV": 0.9,
+    "BFM Business": 1.0,
+    "Challenges": 0.9,
+    "20 Minutes": 0.75,
+}
+
+CATEGORY_WEIGHTS = {
+    "A la une": 1.15,
+    "Politique": 1.05,
+    "International": 1.15,
+    "Economie": 1.15,
+    "France": 1.05,
+    "Tech / Sciences": 0.95,
+    "Culture / Societe": 0.85,
+}
+
+HIGH_IMPACT_KEYWORDS = {
+    "guerre", "cessez", "attaque", "election", "president", "gouvernement",
+    "budget", "inflation", "croissance", "recession", "banque", "bourse",
+    "marche", "taux", "ia", "intelligence", "artificielle", "climat",
+    "justice", "proces", "crise", "accord", "sanction", "europe",
+    "ukraine", "russie", "chine", "etats", "unis", "israel", "iran",
 }
 
 
@@ -2937,6 +3438,56 @@ def title_keywords(value: str) -> set[str]:
         for word in normalized.split()
         if len(word) >= 4 and word not in FRENCH_STOPWORDS and not word.isdigit()
     }
+
+
+def news_cluster_id(keywords: set[str], title: str) -> str:
+    key_terms = sorted(keywords)[:8] or normalize_news_title(title).split()[:8]
+    raw = "|".join(key_terms)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def source_quality_weight(source: str) -> float:
+    label = source or ""
+    for name, weight in SOURCE_QUALITY_WEIGHTS.items():
+        if name.lower() in label.lower():
+            return weight
+    return 0.85
+
+
+def article_age_hours(item: dict, now: datetime | None = None) -> float:
+    reference = now or datetime.now(timezone.utc)
+    published = parse_rss_datetime_value(item.get("published_at"))
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    return max((reference - published).total_seconds() / 3600, 0.0)
+
+
+def freshness_points(item: dict, now: datetime | None = None) -> float:
+    age = article_age_hours(item, now)
+    if age <= 3:
+        return 18.0
+    if age <= 6:
+        return 14.0
+    if age <= 12:
+        return 10.0
+    if age <= 24:
+        return 6.0
+    return 2.0
+
+
+def summarize_cluster_reason(cluster: dict) -> list[str]:
+    reasons = []
+    if cluster.get("article_count", 0) >= 3:
+        reasons.append(f"{cluster.get('article_count')} articles")
+    if cluster.get("source_count", 0) >= 2:
+        reasons.append(f"{cluster.get('source_count')} sources")
+    if cluster.get("impact_keywords"):
+        reasons.append("mots-cles forts: " + ", ".join(cluster["impact_keywords"][:3]))
+    if cluster.get("freshness_score", 0) >= 12:
+        reasons.append("actualite recente")
+    if cluster.get("continuity_bonus", 0) > 0:
+        reasons.append("continuite editoriale")
+    return reasons or ["score editorial stable"]
 
 
 def dedupe_compact_news(items: list[dict], limit: int = 30) -> list[dict]:
@@ -2970,34 +3521,300 @@ def build_news_topic_clusters(items: list[dict], limit: int = 8) -> list[dict]:
             best_cluster["items"].append(item)
             best_cluster["keywords"].update(keywords)
             best_cluster["sources"].add(item.get("source") or "Source inconnue")
+            if item.get("category"):
+                best_cluster["categories"].add(item.get("category"))
         else:
             clusters.append(
                 {
                     "keywords": set(keywords),
                     "items": [item],
                     "sources": {item.get("source") or "Source inconnue"},
+                    "categories": {item.get("category")} if item.get("category") else set(),
                 }
             )
 
-    ranked = sorted(
-        clusters,
-        key=lambda cluster: (len(cluster["items"]), len(cluster["sources"]), len(cluster["keywords"])),
-        reverse=True,
-    )
+    scored = [score_news_topic_cluster(cluster) for cluster in clusters]
+    ranked = sorted(scored, key=lambda cluster: (cluster["score"], cluster["source_count"], cluster["article_count"]), reverse=True)
     result = []
     for cluster in ranked[:limit]:
-        first_item = cluster["items"][0]
-        result.append(
-            {
-                "main_title": first_item.get("title") or "",
-                "sources": sorted(cluster["sources"]),
-                "source_count": len(cluster["sources"]),
-                "article_count": len(cluster["items"]),
-                "keywords": sorted(cluster["keywords"])[:10],
-                "related_titles": [item.get("title") for item in cluster["items"][:5] if item.get("title")],
-            }
-        )
+        result.append(compact_news_cluster(cluster))
     return result
+
+
+def score_news_topic_cluster(cluster: dict, editorial_state: dict | None = None) -> dict:
+    items = cluster.get("items", [])
+    sources = cluster.get("sources", set())
+    categories = {c for c in cluster.get("categories", set()) if c}
+    keywords = cluster.get("keywords", set())
+    first_item = items[0] if items else {}
+    cluster_id = news_cluster_id(keywords, first_item.get("title") or "")
+
+    article_points = min(len(items), 5) * 8.0
+    source_points = min(len(sources), 5) * 9.0
+    freshness_score = max((freshness_points(item) for item in items), default=0.0)
+    quality_score = sum(source_quality_weight(source) for source in sources) / max(len(sources), 1) * 8.0
+    content_score = min(sum(len(item.get("content") or item.get("summary") or "") for item in items) / 900, 12.0)
+    category_score = max((CATEGORY_WEIGHTS.get(category, 0.85) for category in categories), default=0.85) * 8.0
+    impact_keywords = sorted(keywords & HIGH_IMPACT_KEYWORDS)
+    impact_score = min(len(impact_keywords), 5) * 4.0
+
+    continuity_bonus = 0.0
+    if editorial_state:
+        previous_main = editorial_state.get("main_cluster_id")
+        recent_ids = set(editorial_state.get("recent_cluster_ids") or [])
+        if cluster_id == previous_main:
+            continuity_bonus += 14.0
+        elif cluster_id in recent_ids:
+            continuity_bonus += 6.0
+
+    score = article_points + source_points + freshness_score + quality_score + content_score + category_score + impact_score + continuity_bonus
+    return {
+        **cluster,
+        "cluster_id": cluster_id,
+        "article_count": len(items),
+        "source_count": len(sources),
+        "score": round(score, 1),
+        "article_points": round(article_points, 1),
+        "source_points": round(source_points, 1),
+        "freshness_score": round(freshness_score, 1),
+        "quality_score": round(quality_score, 1),
+        "content_score": round(content_score, 1),
+        "category_score": round(category_score, 1),
+        "impact_score": round(impact_score, 1),
+        "continuity_bonus": round(continuity_bonus, 1),
+        "impact_keywords": impact_keywords,
+    }
+
+
+def compact_news_cluster(cluster: dict, max_articles: int = 2) -> dict:
+    items = sorted(
+        cluster.get("items", []),
+        key=lambda item: (
+            source_quality_weight(item.get("source") or ""),
+            freshness_points(item),
+            len(item.get("content") or item.get("summary") or ""),
+        ),
+        reverse=True,
+    )
+    first_item = items[0] if items else {}
+    compact_items = [compact_news_item(item) for item in items[:max_articles]]
+    for idx, item in enumerate(items[:max_articles]):
+        if item.get("content"):
+            compact_items[idx]["content"] = item.get("content", "")[:1800]
+        if item.get("category"):
+            compact_items[idx]["category"] = item.get("category")
+
+    payload = {
+        "cluster_id": cluster.get("cluster_id") or news_cluster_id(cluster.get("keywords", set()), first_item.get("title") or ""),
+        "main_title": first_item.get("title") or "",
+        "summary": clean_summary_text(first_item.get("summary") or first_item.get("content") or "", max_length=420),
+        "sources": sorted(cluster.get("sources", [])),
+        "source_count": len(cluster.get("sources", [])),
+        "article_count": len(cluster.get("items", [])),
+        "categories": sorted(c for c in cluster.get("categories", []) if c),
+        "keywords": sorted(cluster.get("keywords", []))[:12],
+        "impact_keywords": cluster.get("impact_keywords", []),
+        "score": cluster.get("score", 0),
+        "score_breakdown": {
+            "articles": cluster.get("article_points", 0),
+            "sources": cluster.get("source_points", 0),
+            "freshness": cluster.get("freshness_score", 0),
+            "source_quality": cluster.get("quality_score", 0),
+            "content": cluster.get("content_score", 0),
+            "category": cluster.get("category_score", 0),
+            "impact": cluster.get("impact_score", 0),
+            "continuity": cluster.get("continuity_bonus", 0),
+        },
+        "why_selected": summarize_cluster_reason(cluster),
+        "related_titles": [item.get("title") for item in items[:5] if item.get("title")],
+        "reference_articles": compact_items,
+    }
+    return payload
+
+
+def build_scored_news_topic_clusters(items: list[dict], editorial_state: dict | None = None, limit: int = 12) -> list[dict]:
+    raw_clusters: list[dict] = []
+    for item in items:
+        keywords = title_keywords((item.get("title") or "") + " " + (item.get("summary") or "") + " " + (item.get("content") or "")[:500])
+        if not keywords:
+            continue
+        best_cluster = None
+        best_overlap = 0
+        for cluster in raw_clusters:
+            overlap = len(keywords & cluster["keywords"])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_cluster = cluster
+        threshold = 2 if len(keywords) <= 8 else 3
+        if best_cluster is not None and best_overlap >= threshold:
+            best_cluster["items"].append(item)
+            best_cluster["keywords"].update(keywords)
+            best_cluster["sources"].add(item.get("source") or "Source inconnue")
+            if item.get("category"):
+                best_cluster["categories"].add(item.get("category"))
+        else:
+            raw_clusters.append(
+                {
+                    "keywords": set(keywords),
+                    "items": [item],
+                    "sources": {item.get("source") or "Source inconnue"},
+                    "categories": {item.get("category")} if item.get("category") else set(),
+                }
+            )
+
+    scored = [score_news_topic_cluster(cluster, editorial_state=editorial_state) for cluster in raw_clusters]
+    scored.sort(key=lambda cluster: (cluster["score"], cluster["source_count"], cluster["article_count"]), reverse=True)
+    return [compact_news_cluster(cluster) for cluster in scored[:limit]]
+
+
+def digest_categories_match(digest: dict, categories: list[str]) -> bool:
+    return set(digest.get("categories") or []) == set(categories or [])
+
+
+def load_editorial_state() -> dict:
+    from cache import read_cache
+
+    cached = read_cache(EDITORIAL_STATE_CACHE_KEY)
+    data = cached.get("data") if cached else {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_editorial_state(digest: dict) -> None:
+    from cache import write_cache
+
+    clusters = [digest.get("main_topic")] + list(digest.get("secondary_topics") or [])
+    clusters = [cluster for cluster in clusters if cluster]
+    write_cache(
+        EDITORIAL_STATE_CACHE_KEY,
+        {
+            "digest_id": digest.get("digest_id"),
+            "generated_at": digest.get("generated_at_iso"),
+            "main_cluster_id": (digest.get("main_topic") or {}).get("cluster_id"),
+            "main_title": (digest.get("main_topic") or {}).get("main_title"),
+            "recent_cluster_ids": [cluster.get("cluster_id") for cluster in clusters if cluster.get("cluster_id")],
+            "secondary_titles": [cluster.get("main_title") for cluster in digest.get("secondary_topics", []) if cluster.get("main_title")],
+        },
+    )
+
+
+def load_recent_news_digest(categories: list[str], max_age_minutes: int = NEWS_DIGEST_REUSE_MINUTES) -> dict | None:
+    from cache import cache_age_minutes, read_cache
+
+    age = cache_age_minutes(NEWS_DIGEST_CACHE_KEY)
+    cached = read_cache(NEWS_DIGEST_CACHE_KEY)
+    digest = cached.get("data") if cached else None
+    if not isinstance(digest, dict) or age is None:
+        return None
+    if age > max_age_minutes:
+        return None
+    if not digest_categories_match(digest, categories):
+        return None
+    return {**digest, "cache_age_minutes": round(age, 1), "reused": True}
+
+
+def flatten_digest_reference_articles(digest: dict, limit: int = 12) -> list[dict]:
+    articles: list[dict] = []
+    seen_urls: set[str] = set()
+    clusters = [digest.get("main_topic")] + list(digest.get("secondary_topics") or [])
+    for cluster in [cluster for cluster in clusters if cluster]:
+        for item in cluster.get("reference_articles", []) or []:
+            url = item.get("url") or item.get("title") or ""
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            articles.append(item)
+            if len(articles) >= limit:
+                return articles
+    return articles
+
+
+def should_keep_previous_main(candidate_clusters: list[dict], editorial_state: dict) -> tuple[bool, str]:
+    previous_id = editorial_state.get("main_cluster_id")
+    if not previous_id or not candidate_clusters:
+        return False, "pas de sujet principal precedent"
+    current_top = candidate_clusters[0]
+    previous_cluster = next((cluster for cluster in candidate_clusters if cluster.get("cluster_id") == previous_id), None)
+    if not previous_cluster:
+        return False, "ancien sujet absent des flux recents"
+    score_gap = float(current_top.get("score") or 0) - float(previous_cluster.get("score") or 0)
+    if current_top.get("cluster_id") != previous_id and score_gap < NEWS_DIGEST_MAIN_SWITCH_MARGIN:
+        candidate_clusters.remove(previous_cluster)
+        candidate_clusters.insert(0, previous_cluster)
+        return True, f"sujet principal precedent conserve; ecart {score_gap:.1f} < marge {NEWS_DIGEST_MAIN_SWITCH_MARGIN:.1f}"
+    return False, "nouveau sujet nettement dominant ou sujet precedent deja premier"
+
+
+def build_stable_news_digest(
+    enriched_news: list[dict],
+    categories: list[str],
+    force_rebuild: bool = False,
+    max_age_minutes: int = NEWS_DIGEST_REUSE_MINUTES,
+) -> dict:
+    from cache import write_cache
+
+    if not force_rebuild:
+        recent = load_recent_news_digest(categories, max_age_minutes=max_age_minutes)
+        if recent:
+            return recent
+
+    editorial_state = load_editorial_state()
+    clusters = build_scored_news_topic_clusters(enriched_news, editorial_state=editorial_state, limit=12)
+    kept_previous, main_reason = should_keep_previous_main(clusters, editorial_state)
+    selected_clusters = clusters[:6]
+    digest_id = hashlib.sha1(
+        ("|".join(cluster.get("cluster_id", "") for cluster in selected_clusters) + datetime.now().strftime("%Y-%m-%d-%H")).encode("utf-8")
+    ).hexdigest()[:12]
+
+    digest = {
+        "digest_id": digest_id,
+        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "generated_at_iso": datetime.now(timezone.utc).isoformat(),
+        "categories": categories,
+        "main_topic": selected_clusters[0] if selected_clusters else {},
+        "secondary_topics": selected_clusters[1:6],
+        "market_topic": {},
+        "selected_cluster_ids": [cluster.get("cluster_id") for cluster in selected_clusters],
+        "selection_policy": {
+            "reuse_minutes": max_age_minutes,
+            "main_switch_margin": NEWS_DIGEST_MAIN_SWITCH_MARGIN,
+            "kept_previous_main": kept_previous,
+            "main_reason": main_reason,
+        },
+        "raw_article_count": len(enriched_news),
+        "candidate_cluster_count": len(clusters),
+    }
+    write_cache(NEWS_DIGEST_CACHE_KEY, digest)
+    write_editorial_state(digest)
+    write_cache(
+        NEWS_DIGEST_DEBUG_CACHE_KEY,
+        {
+            "digest_id": digest_id,
+            "generated_at": digest["generated_at_iso"],
+            "categories": categories,
+            "selection_policy": digest["selection_policy"],
+            "selected": selected_clusters,
+            "rejected": clusters[6:18],
+        },
+    )
+    return {**digest, "reused": False}
+
+
+def detect_major_digest_override(digest: dict, fresh_items: list[dict]) -> tuple[bool, str]:
+    if not digest or not fresh_items:
+        return False, "pas de nouveau flux a comparer"
+    current_main = digest.get("main_topic") or {}
+    current_score = float(current_main.get("score") or 0)
+    clusters = build_scored_news_topic_clusters(fresh_items, editorial_state=load_editorial_state(), limit=3)
+    if not clusters:
+        return False, "aucun nouveau cluster dominant"
+    challenger = clusters[0]
+    if challenger.get("cluster_id") == current_main.get("cluster_id"):
+        return False, "le sujet principal reste dominant"
+    score_gap = float(challenger.get("score") or 0) - current_score
+    source_ok = int(challenger.get("source_count") or 0) >= max(2, int(current_main.get("source_count") or 0))
+    if score_gap >= 28.0 and source_ok:
+        return True, f"nouveau sujet majeur: +{score_gap:.1f} points et {challenger.get('source_count')} sources"
+    return False, f"pas de remplacement majeur; ecart {score_gap:.1f}"
 
 
 def market_snapshot_records() -> list[dict]:
@@ -3057,17 +3874,49 @@ def collect_podcast_briefing_context(
     include_portfolio: bool = True,
     include_market_context: bool = False,
     items_per_category: int = 8,
+    force_digest_rebuild: bool = False,
 ) -> dict:
     selected_categories = [category for category in categories if category in GENERAL_NEWS_FEEDS] or ["A la une"]
     generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     category_sections = []
     all_news: list[dict] = []
-    for category in selected_categories:
-        items = sort_general_news_items(fetch_general_news(category), "Plus recentes")[:items_per_category]
-        compact_items = [compact_news_item(item) for item in items]
-        category_sections.append({"category": category, "items": compact_items})
-        all_news.extend(compact_items)
+    digest = load_recent_news_digest(selected_categories) if not force_digest_rebuild else None
+    if digest:
+        if float(digest.get("cache_age_minutes") or 0) >= 15:
+            for category in selected_categories:
+                items = sort_general_news_items(fetch_general_news(category), "Plus recentes")[:items_per_category]
+                compact_items = [{**compact_news_item(item), "category": category} for item in items]
+                category_sections.append({"category": category, "items": compact_items})
+                all_news.extend(compact_items)
+            major_override, override_reason = detect_major_digest_override(digest, dedupe_compact_news(all_news, limit=45))
+            if major_override:
+                digest = None
+            else:
+                digest["major_override_check"] = override_reason
+
+    if digest:
+        enriched_news = flatten_digest_reference_articles(digest, limit=12)
+        if not category_sections:
+            category_sections = [{"category": category, "items": []} for category in selected_categories]
+    else:
+        if not all_news:
+            for category in selected_categories:
+                items = sort_general_news_items(fetch_general_news(category), "Plus recentes")[:items_per_category]
+                compact_items = [{**compact_news_item(item), "category": category} for item in items]
+                category_sections.append({"category": category, "items": compact_items})
+                all_news.extend(compact_items)
+        for category in selected_categories:
+            if not any(section.get("category") == category for section in category_sections):
+                category_sections.append({"category": category, "items": []})
+        deduped = dedupe_compact_news(all_news, limit=45)
+        enriched_news = enrich_news_items_with_content(deduped, top_n=16)
+        digest = build_stable_news_digest(
+            enriched_news,
+            selected_categories,
+            force_rebuild=force_digest_rebuild,
+            max_age_minutes=NEWS_DIGEST_REUSE_MINUTES,
+        )
 
     if include_market_context:
         try:
@@ -3081,15 +3930,15 @@ def collect_podcast_briefing_context(
             midcaps = pd.DataFrame()
     else:
         gainers, losers, midcaps = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    deduped = dedupe_compact_news(all_news, limit=35)
-    enriched_news = enrich_news_items_with_content(deduped, top_n=12)
+    digest_clusters = [digest.get("main_topic")] + list(digest.get("secondary_topics") or [])
+    digest_clusters = [cluster for cluster in digest_clusters if cluster]
 
     return {
         "generated_at": generated_at,
         "categories": selected_categories,
-        "top_news": enriched_news,
-        "topic_clusters": build_news_topic_clusters(enriched_news, limit=8),
+        "top_news": flatten_digest_reference_articles(digest, limit=12) or enriched_news,
+        "topic_clusters": digest_clusters,
+        "news_digest": digest,
         "category_sections": category_sections,
         "market_snapshot": market_snapshot_records() if include_market_context else [],
         "gainers": dataframe_records(gainers, limit=5),
@@ -3173,6 +4022,32 @@ def build_podcast_script_prompt(context: dict, duration_minutes: int, tone: str)
     }.get(duration_minutes, {"principal": "700-900", "secondaires": "180-250 chacun (5-6 sujets)", "conclusion": "80"})
 
     parts: list[str] = []
+    digest = context.get("news_digest") or {}
+    digest_clusters = [digest.get("main_topic")] + list(digest.get("secondary_topics") or [])
+    digest_clusters = [cluster for cluster in digest_clusters if cluster]
+
+    if digest_clusters:
+        parts.append("=== DIGEST EDITORIAL FIGE ===")
+        parts.append(
+            f"Digest {digest.get('digest_id', '-')} genere le {digest.get('generated_at', context.get('generated_at', '-'))}. "
+            f"Reutilise: {'oui' if digest.get('reused') else 'non'}."
+        )
+        policy = digest.get("selection_policy") or {}
+        if policy.get("main_reason"):
+            parts.append(f"Decision sujet principal: {policy.get('main_reason')}")
+        for index, cluster in enumerate(digest_clusters, start=1):
+            role = "SUJET PRINCIPAL" if index == 1 else f"SUJET SECONDAIRE {index - 1}"
+            sources_str = ", ".join(cluster.get("sources", [])[:4])
+            reasons = ", ".join(cluster.get("why_selected", [])[:4])
+            parts.append(
+                f"\n{role}: {cluster.get('main_title')}\n"
+                f"Score: {cluster.get('score')} | Articles: {cluster.get('article_count')} | Sources: {sources_str}\n"
+                f"Pourquoi retenu: {reasons or '-'}\n"
+                f"Resume consolide: {cluster.get('summary') or '-'}"
+            )
+            for article in cluster.get("reference_articles", [])[:2]:
+                snippet = (article.get("content") or article.get("summary") or "")[:900]
+                parts.append(f"- Reference [{article.get('source')}]: {article.get('title')} — {snippet}")
 
     top_news = context.get("top_news", [])
     enriched = [item for item in top_news if item.get("content")]
@@ -3232,23 +4107,42 @@ def build_podcast_script_prompt(context: dict, duration_minutes: int, tone: str)
 
     context_text = "\n".join(parts)
 
-    return f"""Tu es redacteur en chef d'un podcast quotidien en francais.
+    return f"""Tu es redacteur en chef et auteur voix d'un podcast quotidien en francais.
 
 CONTRAINTE DE LONGUEUR ABSOLUE : le script DOIT contenir entre {target_words} mots.
 Ne termine PAS avant d'avoir atteint le minimum. Compte mentalement tes mots au fil de la redaction.
 
 Ton : {tone}.
 
+FORMAT AUDIO-FIRST :
+- Ecris pour une voix de synthese, pas pour une lecture a l'ecran.
+- Le texte doit etre beau a ecouter, fluide, naturel, avec un fil narratif.
+- Utilise des phrases respirables, pas trop longues, avec des transitions douces.
+- Evite les listes seches, les titres abrupts, les puces, les numerotations et les signes typographiques inutiles.
+- N'ecris pas de symboles qui se lisent mal a l'audio : pas de slash, pas de pipe, pas de parenthese technique, pas de markdown, pas d'emoji.
+- Remplace les pourcentages par une formulation orale, par exemple "en hausse de trois pour cent".
+- Remplace les sigles ou abreges obscurs par une lecture naturelle quand c'est possible.
+- Ne dis jamais "ouvrez les guillemets", "deux points", "tiret", "slash", "hashtag" ou une notation technique.
+
+HIERARCHIE EDITORIALE :
+- Respecte le DIGEST EDITORIAL FIGE quand il est fourni.
+- Le sujet principal du digest DOIT rester le sujet principal du podcast.
+- Les sujets secondaires doivent suivre globalement l'ordre du digest.
+- Ne remplace pas un sujet du digest par un article isole plus recent.
+- Regroupe les articles d'un meme cluster en un seul sujet coherent.
+
 STRUCTURE ET BUDGET DE MOTS :
 1. Sujet principal ({word_budget['principal']} mots) :
-   - Identifie le sujet dominant du jour (celui qui revient dans plusieurs sources ou le plus developpe).
+   - Utilise le sujet principal du digest.
    - Donne le contexte complet : pourquoi c'est important, historique recent si utile, chiffres cles.
    - Compare les angles des differentes sources sur ce sujet.
    - Explique les implications concretes et ce qu'il faut surveiller.
+   - Commence par une accroche claire, puis deroule progressivement.
 
 2. Sujets secondaires ({word_budget['secondaires']}) :
    - Pour chaque sujet secondaire : donne le contexte, les faits importants, une implication concrete.
    - Ne fais pas de simples titres lus : developpe vraiment chaque point.
+   - Introduis chaque transition avec une phrase naturelle, par exemple "Autre point important", "Dans un autre registre", ou "Pendant ce temps".
 
 3. Point marche ou portefeuille (200 mots si disponible dans le contexte).
 
@@ -3259,7 +4153,10 @@ Regles strictes :
 - N'invente aucun fait absent du contexte ci-dessous.
 - Reformule et enrichis, ne recopie pas les articles mot pour mot.
 - Cite les sources avec naturalite (ex: "selon Le Monde", "d'apres Les Echos").
-- Ecris uniquement le script final pret a etre lu, sans JSON ni commentaires techniques.
+- Ne change pas la hierarchie du digest sauf contradiction factuelle evidente dans le contexte.
+- Evite les doublons : un cluster = un sujet, meme si plusieurs titres sont proches.
+- Ecris uniquement le texte final pret a etre entendu, sans JSON, sans commentaires techniques, sans titres de section.
+- Ne laisse aucun artefact visuel : pas de crochets, pas de markdown, pas de bullet points, pas de lien brut.
 - Si le contexte est riche, developpe davantage. Mieux vaut 2400 mots que 1800 pour un podcast de 10 minutes.
 
 --- CONTEXTE DU JOUR ---
@@ -3276,6 +4173,40 @@ def extract_openai_output_text(payload: dict) -> str:
             if content.get("type") in {"output_text", "text"} and content.get("text"):
                 pieces.append(str(content["text"]))
     return "\n".join(pieces).strip()
+
+
+def normalize_script_for_audio(script: str) -> str:
+    """Nettoie les artefacts visuels qui passent mal en synthese vocale."""
+    text = script or ""
+    replacements = {
+        "\u2022": "",
+        "\u2014": ", ",
+        "\u2013": ", ",
+        "|": ", ",
+        " / ": " ou ",
+        "&": " et ",
+        "#": "numero ",
+        "%": " pour cent",
+        "€": " euros",
+        "$": " dollars",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"(?<!\w)\+(\d)", r"plus \1", text)
+    text = re.sub(r"(?m)^\s*[-*]\s+", "", text)
+    text = re.sub(r"(?m)^\s*\d+\.\s+", "", text)
+    text = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]+", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([.!?]){2,}", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def select_top_articles_with_llm(items: list[dict], api_key: str, n: int = 12) -> list[dict]:
@@ -3318,13 +4249,9 @@ def generate_podcast_script(context: dict, duration_minutes: int, tone: str) -> 
     if not api_key:
         return build_fallback_podcast_script(context, duration_minutes), "fallback"
 
-    # Passe 1 : sélection des articles les plus importants
-    top_news = context.get("top_news", [])
-    selected_articles = select_top_articles_with_llm(top_news, api_key, n=12)
-    enriched_context = {**context, "top_news": selected_articles}
-
-    # Passe 2 : génération du script complet
-    prompt = build_podcast_script_prompt(enriched_context, duration_minutes, tone)
+    # La selection editoriale est deja figee dans news_digest. Le LLM redige,
+    # mais ne re-hierarchise pas librement les articles.
+    prompt = build_podcast_script_prompt(context, duration_minutes, tone)
     response = requests.post(
         "https://api.openai.com/v1/responses",
         headers={
@@ -3342,10 +4269,11 @@ def generate_podcast_script(context: dict, duration_minutes: int, tone: str) -> 
     script = extract_openai_output_text(response.json())
     if not script:
         raise ValueError("Le modele n'a pas renvoye de script exploitable.")
-    return script, "openai"
+    return normalize_script_for_audio(script), "openai"
 
 
 def split_tts_script(script: str, max_chars: int = 3800) -> list[str]:
+    script = normalize_script_for_audio(script)
     paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", script.strip()) if paragraph.strip()]
     chunks: list[str] = []
     current = ""
@@ -3403,7 +4331,7 @@ def generate_local_espeak_audio_file(script: str, output_path: Path, engine_path
     if not engine_path:
         raise ValueError("Aucun moteur espeak local n'est disponible.")
     wav_path = output_path.with_suffix(".wav")
-    input_text = script.strip()
+    input_text = normalize_script_for_audio(script)
     if not input_text:
         raise ValueError("Le script est vide.")
     subprocess.run(
@@ -3461,10 +4389,12 @@ def build_price_figure(
     history: pd.DataFrame,
     label_by_ticker: dict[str, str],
     compress_time_axis: bool = True,
+    primary_ticker: str | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     x_values = format_chart_index(history.index) if compress_time_axis else history.index
     for ticker in history.columns:
+        is_primary = ticker == primary_ticker
         fig.add_trace(
             go.Scatter(
                 x=x_values,
@@ -3472,6 +4402,8 @@ def build_price_figure(
                 mode="lines",
                 connectgaps=True,
                 name=label_by_ticker.get(ticker, ticker),
+                line=dict(width=3.2 if is_primary else 1.7),
+                opacity=1.0 if is_primary else 0.72,
                 hovertemplate="Date : %{x}<br>Prix : %{y:.2f}<extra></extra>",
             )
         )
@@ -3494,10 +4426,12 @@ def build_performance_figure(
     performance: pd.DataFrame,
     label_by_ticker: dict[str, str],
     compress_time_axis: bool = True,
+    primary_ticker: str | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     x_values = format_chart_index(performance.index) if compress_time_axis else performance.index
     for ticker in performance.columns:
+        is_primary = ticker == primary_ticker
         fig.add_trace(
             go.Scatter(
                 x=x_values,
@@ -3505,6 +4439,8 @@ def build_performance_figure(
                 mode="lines",
                 connectgaps=True,
                 name=label_by_ticker.get(ticker, ticker),
+                line=dict(width=3.2 if is_primary else 1.7),
+                opacity=1.0 if is_primary else 0.72,
                 hovertemplate="Date : %{x}<br>Performance : %{y:.2f}%<extra></extra>",
             )
         )
@@ -4283,6 +5219,8 @@ def build_summary_table(
     catalog: pd.DataFrame,
     price_history: pd.DataFrame,
     return_history: pd.DataFrame,
+    regular_price_history: pd.DataFrame | None = None,
+    include_prepost: bool = False,
 ) -> pd.DataFrame:
     rows = []
     catalog_by_ticker = catalog.set_index("ticker")
@@ -4298,19 +5236,59 @@ def build_summary_table(
         end_return = float(return_series.iloc[-1]) if not return_series.empty else 0.0
         performance = ((end_return / base_return) - 1) * 100 if base_return else 0.0
         row = catalog_by_ticker.loc[ticker]
+        asset_type = row["asset_type"]
+        session_raw = infer_market_session(ticker, asset_type=asset_type)
+        session_labels = {
+            "regular": "🟢 Regular",
+            "pre_market": "🟡 Pre-market",
+            "after_hours": "🔵 After-hours",
+            "closed": "⚪ Closed",
+            "24/7": "🟢 24/7",
+            "unknown": "⚪ Unknown",
+        }
+        regular_price = None
+        if regular_price_history is not None and ticker in regular_price_history.columns:
+            regular_series = regular_price_history[ticker].dropna()
+            if not regular_series.empty:
+                regular_price = float(regular_series.iloc[-1])
+        prepost_price = None
+        if include_prepost and regular_price is not None and abs(end_price - regular_price) > max(0.0001, abs(regular_price) * 0.000001):
+            prepost_price = end_price
+        price_source = "Regular"
+        principal_price = regular_price if regular_price is not None else end_price
+        if session_raw in {"pre_market", "after_hours"} and include_prepost and prepost_price is not None:
+            principal_price = prepost_price
+            price_source = "Pre-market" if session_raw == "pre_market" else "After-hours"
+        elif session_raw == "closed":
+            price_source = "Cloture"
+        elif regular_price is None:
+            price_source = "Dernier point Yahoo"
+        last_timestamp = price_series.index[-1]
+        if hasattr(last_timestamp, "strftime"):
+            last_timestamp = last_timestamp.strftime("%d/%m/%Y %H:%M")
         rows.append(
             {
                 "Nom": row["name"],
                 "Ticker": ticker,
+                "Actif": f"{row['name']} ({ticker})",
                 "Type": row["asset_type"],
+                "Region": row.get("market_region") or row.get("region") or infer_market_region(ticker, row.get("asset_type")),
                 "Marche": row["exchange"] or "-",
+                "Devise": row.get("currency") or infer_currency(ticker, default="USD"),
+                "Session": session_labels.get(session_raw, "⚪ Unknown"),
+                "Session brute": session_raw,
+                "Dernier timestamp": last_timestamp,
                 "Debut periode": round(start_price, 2),
-                "Dernier cours": round(end_price, 2),
+                "Prix": round(principal_price, 2),
+                "Source prix": price_source,
+                "Prix regular": round(regular_price, 2) if regular_price is not None else "-",
+                "Prix affiche": round(end_price, 2),
+                "Prix pre/post": round(prepost_price, 2) if prepost_price is not None else "-",
                 "Variation (%)": round(performance, 2),
             }
         )
 
-    return pd.DataFrame(rows).sort_values("Variation (%)", ascending=False).reset_index(drop=True)
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def render_header(catalog: pd.DataFrame, cache_path: Path) -> None:
@@ -4324,7 +5302,7 @@ def render_header(catalog: pd.DataFrame, cache_path: Path) -> None:
     col1.metric("Actifs repertories", f"{len(catalog):,}".replace(",", " "))
     col2.metric("Derniere mise a jour annuaire", last_refresh)
     col3.caption(
-        "Sources : Nasdaq Trader pour les societes cotees US, CoinGecko pour les cryptos, plus une petite liste d'indices majeurs."
+        "Sources : Nasdaq Trader pour les societes US, liste locale de grandes capitalisations europeennes, CoinGecko pour les cryptos, Yahoo Finance pour les prix."
     )
 
 
@@ -4820,6 +5798,12 @@ def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
             key="podcast_include_market_context",
             help="Desactive par defaut : les marches restent un sujet comme les autres dans le briefing generaliste.",
         )
+        force_digest_rebuild = st.toggle(
+            "Reconstruire le digest editorial",
+            value=False,
+            key="podcast_force_digest_rebuild",
+            help="Sinon, un digest recent est reutilise pour stabiliser les podcasts generes a quelques minutes d'intervalle.",
+        )
 
         if st.button("Generer le script du podcast", use_container_width=True):
             with st.spinner("Je collecte les infos, dedoublonne les sujets et prepare le script..."):
@@ -4829,6 +5813,7 @@ def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
                         selected_categories,
                         include_portfolio=include_portfolio,
                         include_market_context=include_market_context,
+                        force_digest_rebuild=force_digest_rebuild,
                     )
                     script, generation_mode = generate_podcast_script(context, duration_minutes, tone)
                     output_dir = get_briefing_output_dir(datetime.now().strftime("%Y-%m-%d-%H%M%S"))
@@ -4844,6 +5829,47 @@ def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
                     st.success(
                         "Script genere avec OpenAI." if generation_mode == "openai" else "Script genere en mode fallback."
                     )
+
+        digest = (st.session_state.get("podcast_context") or {}).get("news_digest") or {}
+        if digest:
+            reused_label = "reutilise" if digest.get("reused") else "reconstruit"
+            main_title = (digest.get("main_topic") or {}).get("main_title") or "-"
+            st.caption(
+                f"Digest editorial {reused_label} · {digest.get('digest_id', '-')} · "
+                f"sujet principal : {main_title}"
+            )
+            with st.expander("Debug digest editorial"):
+                policy = digest.get("selection_policy") or {}
+                st.write(
+                    {
+                        "digest_id": digest.get("digest_id"),
+                        "generated_at": digest.get("generated_at"),
+                        "reused": digest.get("reused"),
+                        "main_reason": policy.get("main_reason"),
+                        "major_override_check": digest.get("major_override_check"),
+                        "raw_article_count": digest.get("raw_article_count"),
+                        "candidate_cluster_count": digest.get("candidate_cluster_count"),
+                    }
+                )
+                rows = []
+                for role, cluster in [("principal", digest.get("main_topic") or {})] + [
+                    (f"secondaire {idx}", cluster)
+                    for idx, cluster in enumerate(digest.get("secondary_topics") or [], start=1)
+                ]:
+                    if not cluster:
+                        continue
+                    rows.append(
+                        {
+                            "Role": role,
+                            "Sujet": cluster.get("main_title"),
+                            "Score": cluster.get("score"),
+                            "Articles": cluster.get("article_count"),
+                            "Sources": cluster.get("source_count"),
+                            "Pourquoi": ", ".join(cluster.get("why_selected", [])),
+                        }
+                    )
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         script_value = st.session_state.get("podcast_script", "")
         if script_value:
@@ -5123,8 +6149,28 @@ def render_comparator_section(
 
     default_labels = visible_catalog[visible_catalog["ticker"].isin(DEFAULT_TICKERS)]["label"].tolist()
 
-    col_period, col_search = st.columns([1, 4])
-    selected_period_label = col_period.selectbox("Durée", options=list(PERIOD_OPTIONS.keys()), index=4)
+    col_period, col_mode, col_prepost, col_search = st.columns([1, 1, 1.4, 4])
+    selected_period_label = col_period.selectbox("Durée", options=list(PERIOD_OPTIONS.keys()), index=0)
+    period_config = PERIOD_OPTIONS[selected_period_label]
+    is_intraday_period = period_config["interval"].endswith("m") or period_config["interval"].endswith("h")
+    advanced_mode = col_mode.toggle(
+        "Mode avancé",
+        value=False,
+        help="Affiche les colonnes techniques, les prix regular/pre-post et tous les actifs selectionnes sur les graphes.",
+        key="main_comparator_advanced_mode",
+    )
+    include_prepost = col_prepost.toggle(
+        "Inclure pre/post",
+        value=False,
+        disabled=not is_intraday_period,
+        help=(
+            "Disponible uniquement sur les intervalles intraday Yahoo Finance. "
+            "Quand actif, les graphes incluent explicitement les points pre-market et after-hours si Yahoo les fournit."
+            if is_intraday_period
+            else "Disponible uniquement sur les vues intraday Yahoo Finance."
+        ),
+        key="main_comparator_prepost",
+    )
     selected_labels = col_search.multiselect(
         "Recherche et comparaison",
         options=visible_catalog["label"].tolist(),
@@ -5139,20 +6185,28 @@ def render_comparator_section(
         st.info("Selectionne au moins un actif pour afficher les graphes.")
         return []
 
-    selected_assets = visible_catalog[visible_catalog["label"].isin(selected_labels)].copy()
+    selected_assets = visible_catalog.set_index("label").loc[selected_labels].reset_index().copy()
     selected_assets = selected_assets.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
     comparison_tickers = selected_assets["ticker"].tolist()
     tickers = tuple(comparison_tickers)
     label_by_ticker = dict(zip(selected_assets["ticker"], selected_assets["name"]))
 
-    period_config = PERIOD_OPTIONS[selected_period_label]
     with st.spinner("Je recupere les historiques de marche..."):
         try:
             price_history, return_history = download_price_histories(
                 tickers=tickers,
                 period=period_config["period"],
                 interval=period_config["interval"],
+                include_prepost=bool(include_prepost and is_intraday_period),
             )
+            regular_price_history = price_history
+            if include_prepost and is_intraday_period:
+                regular_price_history, _ = download_price_histories(
+                    tickers=tickers,
+                    period=period_config["period"],
+                    interval=period_config["interval"],
+                    include_prepost=False,
+                )
         except Exception as exc:  # pragma: no cover - depends on network/provider
             st.error(f"Impossible de recuperer les donnees de marche : {exc}")
             return comparison_tickers
@@ -5165,23 +6219,54 @@ def render_comparator_section(
     if missing_tickers:
         st.warning(f"Aucune donnee exploitable pour : {', '.join(missing_tickers)}")
 
+    graph_tickers = comparison_tickers
     display_history = build_display_history(price_history, smooth_closures)
     display_return_history = build_display_history(return_history, smooth_closures)
-    performance = compute_performance_frame(display_return_history)
+    graph_display_history = display_history[[ticker for ticker in graph_tickers if ticker in display_history.columns]]
+    graph_return_history = display_return_history[[ticker for ticker in graph_tickers if ticker in display_return_history.columns]]
+    graph_performance = compute_performance_frame(graph_return_history)
 
-    price_figure = build_price_figure(display_history, label_by_ticker, smooth_closures)
+    primary_ticker = graph_tickers[0] if graph_tickers else None
+    price_figure = build_price_figure(graph_display_history, label_by_ticker, smooth_closures, primary_ticker=primary_ticker)
     if use_log_scale:
         price_figure.update_yaxes(type="log")
 
-    summary_table = build_summary_table(selected_assets, price_history, return_history)
+    summary_table = build_summary_table(
+        selected_assets,
+        price_history,
+        return_history,
+        regular_price_history=regular_price_history,
+        include_prepost=bool(include_prepost and is_intraday_period),
+    )
 
     st.subheader("Vue d'ensemble")
-    st.dataframe(summary_table, width="stretch", hide_index=True)
+    simple_cols = ["Actif", "Region", "Prix", "Variation (%)", "Session"]
+    advanced_cols = [
+        "Actif", "Region", "Prix", "Variation (%)", "Session", "Source prix",
+        "Prix regular", "Prix pre/post", "Prix affiche", "Dernier timestamp",
+        "Marche", "Devise", "Type",
+    ]
+    display_cols = advanced_cols if advanced_mode else simple_cols
+    display_cols = [col for col in display_cols if col in summary_table.columns]
+    st.dataframe(
+        summary_table[display_cols],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Prix": st.column_config.NumberColumn("Prix", format="%.2f"),
+            "Prix regular": st.column_config.Column("Prix regular"),
+            "Prix pre/post": st.column_config.Column("Prix pre/post"),
+            "Prix affiche": st.column_config.NumberColumn("Prix affiche", format="%.2f"),
+            "Variation (%)": st.column_config.NumberColumn("Variation", format="%+.2f%%"),
+            "Session": st.column_config.TextColumn("Session"),
+            "Source prix": st.column_config.TextColumn("Source prix"),
+        },
+    )
 
     performance_tab, price_tab = st.tabs(["Performance (%)", "Prix"])
     with performance_tab:
         st.plotly_chart(
-            build_performance_figure(performance, label_by_ticker, smooth_closures),
+            build_performance_figure(graph_performance, label_by_ticker, smooth_closures, primary_ticker=primary_ticker),
             width="stretch",
         )
     with price_tab:
@@ -5195,7 +6280,17 @@ def render_comparator_section(
             if smooth_closures
             else "Les graphes suivent uniquement les points de cotation reels."
         )
-        + " Les performances (%) sont calculees sur une serie ajustee quand elle est disponible."
+        + " Les performances (%) sont calculees sur une serie ajustee quand elle est disponible. "
+        + (
+            "Pre/after-market inclus explicitement pour cette vue intraday."
+            if include_prepost and is_intraday_period
+            else "Pre/after-market non inclus dans cette vue."
+        )
+        + (
+            " Mode simple : tableau reduit, graphes avec tous les actifs selectionnes."
+            if not advanced_mode
+            else " Mode avance : toutes les colonnes et tous les actifs selectionnes sont affiches."
+        )
     )
     return comparison_tickers
 
@@ -5345,9 +6440,7 @@ def main() -> None:
 
     catalog = load_symbol_catalog(max(cache_path.stat().st_mtime, crypto_cache_path.stat().st_mtime))
     render_header(catalog, cache_path)
-    page_names = ["Comparateur", "Portefeuille", "Marche du jour", "Analyse", "Actualites", "📋 Logs de connexion"]
-    if current_user["role"] == "admin":
-        page_names.append("Admin utilisateurs")
+    page_names = ["Comparateur", "Portefeuille", "Marche du jour", "Analyse", "Actualites"]
     if st.session_state.get("main_page") not in page_names:
         st.session_state["main_page"] = page_names[0]
     selected_page = st.radio(
@@ -5376,20 +6469,10 @@ def main() -> None:
         render_portfolio_section(catalog, current_user)
 
     elif selected_page == "Analyse":
-        render_market_movers_section(catalog)
-        st.divider()
         render_midcap_recommendations_section()
-        st.divider()
-        render_company_profile_section(catalog)
 
     elif selected_page == "Actualites":
         render_news_section(catalog, comparison_tickers, current_user)
-
-    elif selected_page == "📋 Logs de connexion":
-        display_connection_logs()
-
-    elif selected_page == "Admin utilisateurs" and current_user["role"] == "admin":
-        render_user_management_section(current_user)
 
 
 def run_daily_news_email_command() -> int:

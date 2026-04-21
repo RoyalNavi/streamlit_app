@@ -32,6 +32,20 @@ BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
 from cache import write_cache, read_cache
+from market_universe import (
+    infer_currency,
+    infer_market_region,
+    infer_market_session,
+    latest_market_observation,
+    recommendation_europe_equities,
+)
+from smallcap_scanner import scan_small_cap_opportunities, save_smallcap_results
+from signal_tracking import (
+    init_tracking_db,
+    register_detected_signals,
+    update_signal_outcomes,
+)
+from news_context import enrich_rows_with_news_context
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -80,6 +94,14 @@ MIN_PRICE = 7.0
 MIN_MARKET_CAP = 500_000_000
 MIN_AVG_VOLUME = 500_000
 MIN_HISTORY_DAYS = 50
+EUROPE_MIN_AVG_VOLUME = 120_000
+SIGNAL_AGE_SOFT_LIMIT_MINUTES = 6 * 60
+SIGNAL_AGE_HARD_LIMIT_MINUTES = 24 * 60
+MAX_MONITORED_UNIVERSE = 450
+MAX_SCORING_SHORTLIST = 170
+TARGET_US_MONITORED = 330
+TARGET_EUROPE_MONITORED = 120
+MIN_EUROPE_SHORTLIST = 45
 
 # ---------------------------------------------------------------------------
 # Technical indicators (pandas / numpy, sans dépendance externe)
@@ -287,7 +309,12 @@ def init_signal_db() -> None:
                 consecutive_hits INTEGER,
                 recent_top_hits INTEGER,
                 signal_age_minutes REAL,
-                stability_score REAL
+                stability_score REAL,
+                market_region TEXT,
+                market_session TEXT,
+                last_market_timestamp TEXT,
+                last_observed_price REAL,
+                new_observation INTEGER
             )
             """
         )
@@ -303,6 +330,10 @@ def init_signal_db() -> None:
                 recent_top_hits INTEGER NOT NULL DEFAULT 0,
                 confirmed INTEGER NOT NULL DEFAULT 0,
                 stability_score REAL NOT NULL DEFAULT 0,
+                market_region TEXT,
+                market_session TEXT,
+                last_market_timestamp TEXT,
+                last_observed_price REAL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -328,6 +359,22 @@ def init_signal_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_snapshots_ticker_time ON stock_signal_snapshots(ticker, calculated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_snapshots_run ON stock_signal_snapshots(run_id)")
 
+        _ensure_column(conn, "stock_signal_snapshots", "market_region", "TEXT")
+        _ensure_column(conn, "stock_signal_snapshots", "market_session", "TEXT")
+        _ensure_column(conn, "stock_signal_snapshots", "last_market_timestamp", "TEXT")
+        _ensure_column(conn, "stock_signal_snapshots", "last_observed_price", "REAL")
+        _ensure_column(conn, "stock_signal_snapshots", "new_observation", "INTEGER")
+        _ensure_column(conn, "stock_signal_state", "market_region", "TEXT")
+        _ensure_column(conn, "stock_signal_state", "market_session", "TEXT")
+        _ensure_column(conn, "stock_signal_state", "last_market_timestamp", "TEXT")
+        _ensure_column(conn, "stock_signal_state", "last_observed_price", "REAL")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
 
 def _json_list(values: list[str]) -> str:
     return json.dumps(values or [], ensure_ascii=False)
@@ -347,6 +394,7 @@ def _recent_top_hits(conn: sqlite3.Connection, ticker: str, rank_global: int) ->
         """
         SELECT run_id
         FROM stock_signal_snapshots
+        WHERE COALESCE(new_observation, 1) = 1
         GROUP BY run_id
         ORDER BY MAX(id) DESC
         LIMIT ?
@@ -361,11 +409,40 @@ def _recent_top_hits(conn: sqlite3.Connection, ticker: str, rank_global: int) ->
         f"""
         SELECT COUNT(*)
         FROM stock_signal_snapshots
-        WHERE ticker = ? AND rank_global <= ? AND run_id IN ({placeholders})
+        WHERE ticker = ? AND rank_global <= ? AND COALESCE(new_observation, 1) = 1 AND run_id IN ({placeholders})
         """,
         (ticker, RECENT_TOP_N, *run_ids),
     ).fetchone()[0]
     return int(count) + (1 if rank_global <= RECENT_TOP_N else 0)
+
+
+def _is_new_market_observation(state: sqlite3.Row | None, row: dict) -> bool:
+    if state is None:
+        return True
+    current_ts = row.get("last_market_timestamp")
+    previous_ts = state["last_market_timestamp"] if "last_market_timestamp" in state.keys() else None
+    if current_ts and current_ts != previous_ts:
+        return True
+    current_price = row.get("last_observed_price")
+    previous_price = state["last_observed_price"] if "last_observed_price" in state.keys() else None
+    try:
+        current_float = float(current_price)
+        previous_float = float(previous_price)
+    except Exception:
+        return False
+    tolerance = max(0.0001, abs(previous_float) * 0.000001)
+    return abs(current_float - previous_float) > tolerance
+
+
+def _signal_age_penalty(signal_age_minutes: float, new_observation: bool) -> float:
+    penalty = 0.0
+    if signal_age_minutes >= SIGNAL_AGE_HARD_LIMIT_MINUTES:
+        penalty += 0.8
+    elif signal_age_minutes >= SIGNAL_AGE_SOFT_LIMIT_MINUTES:
+        penalty += 0.35
+    if not new_observation:
+        penalty += 0.25
+    return round(penalty, 2)
 
 
 def apply_signal_confirmation(rows: list[dict], run_id: str, calculated_at: str) -> list[dict]:
@@ -382,17 +459,37 @@ def apply_signal_confirmation(rows: list[dict], run_id: str, calculated_at: str)
         conn.row_factory = sqlite3.Row
         for row in rows:
             ticker = row["Ticker"]
-            score = float(row.get("Score") or 0.0)
+            raw_score = float(row.get("Score") or 0.0)
             rank_global = int(row.get("Rank_Global") or 999)
             state = conn.execute(
                 "SELECT * FROM stock_signal_state WHERE ticker = ?",
                 (ticker,),
             ).fetchone()
 
-            above_threshold = score >= SIGNAL_CONFIRM_THRESHOLD
             previous_hits = int(state["consecutive_hits"]) if state else 0
-            consecutive_hits = previous_hits + 1 if above_threshold else 0
-            recent_top_hits = _recent_top_hits(conn, ticker, rank_global)
+            new_observation = _is_new_market_observation(state, row)
+
+            preliminary_above_threshold = raw_score >= SIGNAL_CONFIRM_THRESHOLD
+            first_seen_at = state["first_seen_at"] if state and preliminary_above_threshold and state["first_seen_at"] else calculated_at
+            if not preliminary_above_threshold:
+                first_seen_at = None
+            first_dt = _parse_iso(first_seen_at)
+            signal_age = (now_dt - first_dt).total_seconds() / 60 if first_dt else 0.0
+            age_penalty = _signal_age_penalty(signal_age, new_observation) if preliminary_above_threshold else 0.0
+            score = round(max(raw_score - age_penalty, 0.0), 1)
+            above_threshold = score >= SIGNAL_CONFIRM_THRESHOLD
+            if preliminary_above_threshold and not above_threshold:
+                first_seen_at = None
+                signal_age = 0.0
+
+            consecutive_hits = previous_hits
+            if above_threshold and new_observation:
+                consecutive_hits = previous_hits + 1
+            elif not above_threshold:
+                consecutive_hits = 0
+
+            previous_recent_top_hits = int(state["recent_top_hits"]) if state else 0
+            recent_top_hits = _recent_top_hits(conn, ticker, rank_global) if new_observation else previous_recent_top_hits
 
             previous_score = float(state["last_score"]) if state and state["last_score"] is not None else score
             score_delta = abs(score - previous_score)
@@ -405,15 +502,13 @@ def apply_signal_confirmation(rows: list[dict], run_id: str, calculated_at: str)
                 consecutive_hits >= SIGNAL_CONFIRM_CYCLES or recent_top_hits >= 3
             )
 
-            first_seen_at = state["first_seen_at"] if state and above_threshold and state["first_seen_at"] else calculated_at
-            if not above_threshold:
-                first_seen_at = None
-            first_dt = _parse_iso(first_seen_at)
-            signal_age = (now_dt - first_dt).total_seconds() / 60 if first_dt else 0.0
-
             row["Confirmed"] = bool(confirmed)
+            row["Raw_Score"] = round(raw_score, 1)
+            row["Score"] = score
+            row["Age_Penalty"] = age_penalty
             row["Consecutive_Hits"] = consecutive_hits
             row["Recent_Top_Hits"] = recent_top_hits
+            row["new_observation"] = bool(new_observation)
             row["Signal_Age_Minutes"] = round(signal_age, 1)
             row["Stability_Score"] = round(stability_score, 1)
             row["Score_Delta"] = round(score - previous_score, 2)
@@ -422,9 +517,10 @@ def apply_signal_confirmation(rows: list[dict], run_id: str, calculated_at: str)
                 """
                 INSERT OR REPLACE INTO stock_signal_state (
                     ticker, setup_type, first_seen_at, last_seen_at, last_score,
-                    consecutive_hits, recent_top_hits, confirmed, stability_score, updated_at
+                    consecutive_hits, recent_top_hits, confirmed, stability_score,
+                    market_region, market_session, last_market_timestamp, last_observed_price, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ticker,
@@ -436,6 +532,10 @@ def apply_signal_confirmation(rows: list[dict], run_id: str, calculated_at: str)
                     recent_top_hits,
                     int(confirmed),
                     stability_score,
+                    row.get("market_region"),
+                    row.get("market_session"),
+                    row.get("last_market_timestamp"),
+                    row.get("last_observed_price"),
                     calculated_at,
                 ),
             )
@@ -448,9 +548,11 @@ def apply_signal_confirmation(rows: list[dict], run_id: str, calculated_at: str)
                     setup_type, score, b_trend, b_momentum, b_force, b_setup, b_risk,
                     price, rsi, macd, rs_spy_1m, rs_spy_3m, distance_ma20,
                     why_selected, risk_flags, confirmed, consecutive_hits,
-                    recent_top_hits, signal_age_minutes, stability_score
+                    recent_top_hits, signal_age_minutes, stability_score,
+                    market_region, market_session, last_market_timestamp,
+                    last_observed_price, new_observation
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -478,6 +580,11 @@ def apply_signal_confirmation(rows: list[dict], run_id: str, calculated_at: str)
                     row.get("Recent_Top_Hits"),
                     row.get("Signal_Age_Minutes"),
                     row.get("Stability_Score"),
+                    row.get("market_region"),
+                    row.get("market_session"),
+                    row.get("last_market_timestamp"),
+                    row.get("last_observed_price"),
+                    int(bool(row.get("new_observation"))),
                 ),
             )
     return rows
@@ -492,119 +599,289 @@ import re
 _EXCL = re.compile(EXCLUDED_PATTERN, re.IGNORECASE)
 
 
-def _screen(sort_field: str = "percentchange", cap_min: int = 500_000_000, size: int = 100) -> list[dict]:
+def _screen(
+    sort_field: str = "percentchange",
+    cap_min: int = 500_000_000,
+    size: int = 100,
+    volume_min: int = 300_000,
+    cap_max: int | None = None,
+    label: str | None = None,
+) -> list[dict]:
     filters = [
         yf.EquityQuery("eq", ["region", "us"]),
         yf.EquityQuery("is-in", ["exchange", "NMS", "NYQ", "ASE"]),
         yf.EquityQuery("gte", ["intradaymarketcap", cap_min]),
         yf.EquityQuery("gte", ["intradayprice", 5]),
-        yf.EquityQuery("gt", ["dayvolume", 300_000]),
+        yf.EquityQuery("gt", ["dayvolume", volume_min]),
     ]
+    if cap_max is not None:
+        filters.append(yf.EquityQuery("lte", ["intradaymarketcap", cap_max]))
     try:
         payload = yf.screen(yf.EquityQuery("and", filters), size=size, sortField=sort_field, sortAsc=False)
         return [q for q in payload.get("quotes", []) if q.get("symbol") and not _EXCL.search(str(q.get("shortName") or ""))]
     except Exception as e:
-        log.warning(f"_screen({sort_field}) error: {e}")
+        log.warning(f"_screen({label or sort_field}) error: {e}")
         return []
 
 
-def build_candidate_universe(spy_hist: pd.DataFrame) -> tuple[list[dict], dict[str, pd.DataFrame]]:
-    """
-    Construit un univers en 3 parties :
-      40 top movers du jour
-    + 40 meilleurs momentum 1m vs SPY (sur un univers large)
-    + jusqu'à 20 tickers de la watchlist persistante
-    Retourne (quotes_dict_ordered, histories)
-    """
-    # --- Partie 1 : top 40 movers du jour ---
-    # --- Partie 1 : top movers par segment (univers équilibré) ---
-    # Un screen global biaiserait vers les large caps (plus liquides, plus couvertes).
-    # On screen explicitement chaque segment pour avoir de vraies meilleures small/mid/large.
-    seg_screens = [
-        _screen("percentchange", cap_min=300_000_000,    size=50),   # Small
-        _screen("percentchange", cap_min=2_000_000_000,  size=50),   # Mid
-        _screen("percentchange", cap_min=10_000_000_000, size=50),   # Large
-    ]
-    movers_quotes = [q for batch in seg_screens for q in batch]
-    movers_tickers = list(dict.fromkeys(q["symbol"] for q in movers_quotes))[:60]
+def _fast_info_quote(ticker: str) -> dict:
+    try:
+        fast = yf.Ticker(ticker).fast_info
+    except Exception:
+        fast = {}
+    if fast is None:
+        fast = {}
 
-    # --- Partie 2 : momentum 1m (univers large trié par volume pour diversifier) ---
-    broad_quotes = _screen("regularMarketVolume", cap_min=500_000_000, size=100)
-    broad_tickers = [q["symbol"] for q in broad_quotes]
+    def _get(*keys):
+        for key in keys:
+            try:
+                value = fast.get(key)
+            except Exception:
+                value = None
+            if value is not None:
+                return value
+        return None
 
-    # --- Partie 3 : watchlist persistante ---
-    wl = read_cache("watchlist") or {"data": []}
-    watchlist_tickers = [str(t).upper() for t in (wl.get("data") or []) if t][:20]
+    return {
+        "marketCap": _get("marketCap", "market_cap"),
+        "averageDailyVolume3Month": _get("threeMonthAverageVolume", "tenDayAverageVolume"),
+        "regularMarketPrice": _get("lastPrice", "last_price", "regularMarketPrice"),
+    }
 
-    # Univers brut (dédupliqué)
-    all_tickers = list(dict.fromkeys(movers_tickers + broad_tickers + watchlist_tickers))
-    all_quotes_map = {q["symbol"]: q for q in movers_quotes + broad_quotes}
 
-    # Fetch histories via un batch yfinance stable. Les downloads parallèles
-    # peuvent contaminer les colonnes entre tickers selon la version yfinance.
-    log.info(f"build_candidate_universe — fetch historiques pour {len(all_tickers)} tickers")
-    histories = _fetch_histories(all_tickers, "3mo")
+def _local_europe_quotes() -> list[dict]:
+    quotes = []
+    for item in recommendation_europe_equities():
+        ticker = item["ticker"].upper()
+        fast_quote = _fast_info_quote(ticker)
+        quotes.append(
+            {
+                "symbol": ticker,
+                "shortName": item["name"],
+                "longName": item["name"],
+                "fullExchangeName": item["exchange"],
+                "marketCap": fast_quote.get("marketCap"),
+                "averageDailyVolume3Month": fast_quote.get("averageDailyVolume3Month"),
+                "regularMarketPrice": fast_quote.get("regularMarketPrice"),
+                "currency": item.get("currency") or infer_currency(ticker),
+                "market_region": "Europe",
+                "_source": "europe_liquid_local",
+            }
+        )
+    return quotes
 
-    # Calculer RS 1m pour chaque ticker → top 40 momentum
-    def _rs1m(t: str) -> float:
-        h = histories.get(t, pd.DataFrame())
-        if h.empty or "Close" not in h.columns or spy_hist.empty or "Close" not in spy_hist.columns:
-            return -999.0
-        rs = calc_relative_strength(h["Close"], spy_hist["Close"], 21)
-        if rs is None:
-            return -999.0
-        try:
-            return float(rs)
-        except Exception:
-            return -999.0
 
-    momentum_ranked = sorted(all_tickers, key=_rs1m, reverse=True)[:40]
-
-    # Construire l'univers final ordonné (movers d'abord, puis momentum, puis watchlist)
-    universe_tickers: list[str] = []
-    seen: set[str] = set()
-    for t in movers_tickers + momentum_ranked + watchlist_tickers:
-        if t not in seen:
-            universe_tickers.append(t)
-            seen.add(t)
-
-    # Pour les tickers watchlist absents du screen, créer un quote minimal depuis l'historique
-    for t in watchlist_tickers:
-        if t not in all_quotes_map:
-            h = histories.get(t, pd.DataFrame())
-            if not h.empty and "Close" in h.columns and len(h) >= 2:
-                price = float(h["Close"].iloc[-1])
-                prev = float(h["Close"].iloc[-2])
-                all_quotes_map[t] = {
-                    "symbol": t, "shortName": t,
-                    "regularMarketPrice": price,
-                    "regularMarketChangePercent": (price / prev - 1) * 100,
-                    "marketCap": 0, "regularMarketVolume": 0,
-                }
-
-    # Tagguer la source pour transparence
-    movers_set = set(movers_tickers)
-    momentum_set = set(momentum_ranked)
-    wl_set = set(watchlist_tickers)
-    universe_quotes = []
-    for t in universe_tickers:
-        if t not in all_quotes_map:
+def _merge_candidates(candidate_map: dict[str, dict], quotes: list[dict], source: str) -> None:
+    for quote in quotes:
+        ticker = str(quote.get("symbol") or "").upper()
+        if not ticker:
             continue
-        q = dict(all_quotes_map[t])
-        src = []
-        if t in movers_set: src.append("movers")
-        if t in momentum_set: src.append("momentum1m")
-        if t in wl_set: src.append("watchlist")
-        q["_source"] = "+".join(src) or "screen"
-        universe_quotes.append(q)
+        if ticker not in candidate_map:
+            candidate_map[ticker] = {"quote": dict(quote), "sources": []}
+        else:
+            candidate_map[ticker]["quote"].update({k: v for k, v in quote.items() if v is not None})
+        if source not in candidate_map[ticker]["sources"]:
+            candidate_map[ticker]["sources"].append(source)
 
+
+def _candidate_source_counts(candidate_map: dict[str, dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for payload in candidate_map.values():
+        for source in payload.get("sources", []):
+            counts[source] = counts.get(source, 0) + 1
+    return counts
+
+
+def _history_pre_score(ticker: str, quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sources: list[str]) -> tuple[float, dict]:
+    if hist.empty or "Close" not in hist.columns:
+        return -999.0, {}
+    closes = _to_series(hist["Close"])
+    if len(closes) < MIN_HISTORY_DAYS:
+        return -999.0, {}
+    price = float(closes.iloc[-1])
+    if price < MIN_PRICE:
+        return -999.0, {}
+
+    volumes = _to_series(hist["Volume"]) if "Volume" in hist.columns else pd.Series(dtype=float)
+    avg_vol = float(volumes.tail(50).mean()) if len(volumes) >= 20 else float("nan")
+    market_region = quote.get("market_region") or infer_market_region(ticker)
+    min_volume = EUROPE_MIN_AVG_VOLUME if market_region == "Europe" else MIN_AVG_VOLUME
+    if pd.isna(avg_vol) or avg_vol < min_volume:
+        return -999.0, {}
+
+    rs_1m = calc_relative_strength(closes, spy_hist["Close"], 21) if not spy_hist.empty and "Close" in spy_hist.columns else None
+    rs_3m = calc_relative_strength(closes, spy_hist["Close"], 63) if not spy_hist.empty and "Close" in spy_hist.columns else None
+    ma20 = float(closes.tail(20).mean()) if len(closes) >= 20 else price
+    dist_ma20 = (price - ma20) / ma20 * 100 if ma20 else 0.0
+    high_52 = float(closes.tail(min(len(closes), 252)).max())
+    high_proximity = price / high_52 if high_52 else 0.0
+    rsi_val = calc_rsi(closes)
+
+    pre_score = 0.0
+    pre_score += min(max((avg_vol / min_volume) - 1, 0), 3) * 0.4
+    if rs_1m is not None:
+        pre_score += max(min(float(rs_1m), 15), -15) * 0.10
+    if rs_3m is not None:
+        pre_score += max(min(float(rs_3m), 25), -25) * 0.05
+    if high_proximity >= 0.95:
+        pre_score += 1.0
+    elif high_proximity >= 0.90:
+        pre_score += 0.5
+    if -1 <= dist_ma20 <= 7:
+        pre_score += 1.0
+    elif dist_ma20 > 15:
+        pre_score -= 1.2
+    elif dist_ma20 > 10:
+        pre_score -= 0.5
+    if rsi_val > 75:
+        pre_score -= 1.0
+    elif rsi_val > 70:
+        pre_score -= 0.4
+    if "watchlist" in sources:
+        pre_score += 2.0
+    if "europe_liquid_local" in sources:
+        pre_score += 0.35
+    if any(source in sources for source in ("us_large_liquid", "us_mid_liquid", "us_top_volume")):
+        pre_score += 0.4
+    if any(source in sources for source in ("us_movers", "us_small_quality")):
+        pre_score += 0.2
+
+    return round(pre_score, 3), {
+        "_pre_score": round(pre_score, 3),
+        "_pre_rs_1m": rs_1m,
+        "_pre_rs_3m": rs_3m,
+        "_pre_dist_ma20": round(dist_ma20, 2),
+        "_pre_rsi": round(rsi_val, 1),
+        "_pre_high_proximity": round(high_proximity, 3),
+    }
+
+
+def build_candidate_universe(spy_hist: pd.DataFrame) -> tuple[list[dict], dict[str, pd.DataFrame], dict]:
+    started_at = datetime.now()
+    build_monitored_started_at = datetime.now()
+    candidate_map: dict[str, dict] = {}
+
+    screen_specs = [
+        ("us_large_liquid", "intradaymarketcap", 10_000_000_000, None, 500_000, 180),
+        ("us_mid_liquid", "intradaymarketcap", 2_000_000_000, 10_000_000_000, 400_000, 180),
+        ("us_small_quality", "percentchange", 500_000_000, 2_000_000_000, 500_000, 140),
+        ("us_top_volume", "dayvolume", 500_000_000, None, 500_000, 180),
+        ("us_movers", "percentchange", 500_000_000, None, 300_000, 140),
+    ]
+    for label, sort_field, cap_min, cap_max, volume_min, size in screen_specs:
+        quotes = _screen(sort_field, cap_min=cap_min, cap_max=cap_max, volume_min=volume_min, size=size, label=label)
+        _merge_candidates(candidate_map, quotes, label)
+        log.info(f"collecte {label}: {len(quotes)} quotes, {len(candidate_map)} candidats dedup")
+
+    europe_quotes = _local_europe_quotes()
+    _merge_candidates(candidate_map, europe_quotes[:TARGET_EUROPE_MONITORED], "europe_liquid_local")
+    log.info(f"collecte europe_liquid_local: {len(europe_quotes)} quotes, {len(candidate_map)} candidats dedup")
+
+    wl = read_cache("watchlist") or {"data": []}
+    watchlist_tickers = [str(t).upper() for t in (wl.get("data") or []) if t][:30]
+    _merge_candidates(candidate_map, [{"symbol": ticker, "shortName": ticker} for ticker in watchlist_tickers], "watchlist")
+
+    europe_candidates = [
+        ticker for ticker, payload in candidate_map.items()
+        if (payload["quote"].get("market_region") or infer_market_region(ticker)) == "Europe"
+    ]
+    us_candidates = [
+        ticker for ticker, payload in candidate_map.items()
+        if (payload["quote"].get("market_region") or infer_market_region(ticker)) == "US"
+    ]
+    other_candidates = [
+        ticker for ticker in candidate_map
+        if ticker not in set(europe_candidates) and ticker not in set(us_candidates)
+    ]
+    monitored_tickers = list(dict.fromkeys(
+        europe_candidates[:TARGET_EUROPE_MONITORED]
+        + us_candidates[: max(MAX_MONITORED_UNIVERSE - min(len(europe_candidates), TARGET_EUROPE_MONITORED), 0)]
+        + other_candidates
+    ))[:MAX_MONITORED_UNIVERSE]
+    monitored_region_counts: dict[str, int] = {}
+    for ticker in monitored_tickers:
+        region = candidate_map[ticker]["quote"].get("market_region") or infer_market_region(ticker)
+        monitored_region_counts[region] = monitored_region_counts.get(region, 0) + 1
+    build_monitored_seconds = (datetime.now() - build_monitored_started_at).total_seconds()
     log.info(
-        f"Univers final : {len(universe_quotes)} actions "
-        f"({len(movers_set & set(universe_tickers))} movers, "
-        f"{len(momentum_set & set(universe_tickers))} momentum, "
-        f"{len(wl_set & set(universe_tickers))} watchlist)"
+        "TIMING build_monitored_universe "
+        f"seconds={build_monitored_seconds:.1f} "
+        f"candidates_dedup={len(candidate_map)} monitored={len(monitored_tickers)} "
+        f"regions={monitored_region_counts}"
     )
-    return universe_quotes, histories
+
+    log.info(f"build_candidate_universe — fetch historiques surveillance pour {len(monitored_tickers)} tickers")
+    histories = _fetch_histories(monitored_tickers, "6mo")
+
+    preselect_started_at = datetime.now()
+    ranked: list[tuple[float, str]] = []
+    pre_metrics: dict[str, dict] = {}
+    for ticker in monitored_tickers:
+        payload = candidate_map[ticker]
+        score, metrics = _history_pre_score(ticker, payload["quote"], histories.get(ticker, pd.DataFrame()), spy_hist, payload["sources"])
+        if score <= -999:
+            continue
+        ranked.append((score, ticker))
+        pre_metrics[ticker] = metrics
+
+    ranked.sort(reverse=True)
+    ranked_tickers = [ticker for _, ticker in ranked]
+    europe_ranked = [
+        ticker for _, ticker in ranked
+        if (candidate_map[ticker]["quote"].get("market_region") or infer_market_region(ticker)) == "Europe"
+    ]
+    shortlist_tickers = list(dict.fromkeys(europe_ranked[:MIN_EUROPE_SHORTLIST] + ranked_tickers))[:MAX_SCORING_SHORTLIST]
+    for ticker in watchlist_tickers:
+        if ticker in monitored_tickers and ticker not in shortlist_tickers:
+            shortlist_tickers.append(ticker)
+    shortlist_tickers = shortlist_tickers[:MAX_SCORING_SHORTLIST]
+
+    universe_quotes = []
+    for ticker in shortlist_tickers:
+        payload = candidate_map.get(ticker)
+        if not payload:
+            continue
+        quote = dict(payload["quote"])
+        sources = payload.get("sources", [])
+        quote["_source"] = "+".join(sources) or "screen"
+        quote["_sources"] = sources
+        quote["market_region"] = quote.get("market_region") or infer_market_region(ticker)
+        quote.update(pre_metrics.get(ticker, {}))
+        universe_quotes.append(quote)
+
+    source_counts = _candidate_source_counts(candidate_map)
+    shortlist_region_counts: dict[str, int] = {}
+    for quote in universe_quotes:
+        region = quote.get("market_region") or infer_market_region(quote.get("symbol"))
+        shortlist_region_counts[region] = shortlist_region_counts.get(region, 0) + 1
+    preselect_seconds = (datetime.now() - preselect_started_at).total_seconds()
+    log.info(
+        "TIMING preselect_from_monitored_universe "
+        f"seconds={preselect_seconds:.1f} "
+        f"monitored={len(monitored_tickers)} preselection_candidates={len(ranked)} "
+        f"shortlist={len(universe_quotes)} regions={shortlist_region_counts}"
+    )
+
+    elapsed = (datetime.now() - started_at).total_seconds()
+    meta = {
+        "monitored_universe_size": len(monitored_tickers),
+        "scoring_shortlist_size": len(universe_quotes),
+        "monitored_region_counts": monitored_region_counts,
+        "shortlist_region_counts": shortlist_region_counts,
+        "source_counts": source_counts,
+        "preselection_candidates": len(ranked),
+        "target_monitored_universe": MAX_MONITORED_UNIVERSE,
+        "target_scoring_shortlist": MAX_SCORING_SHORTLIST,
+        "build_seconds": round(elapsed, 1),
+        "build_monitored_seconds": round(build_monitored_seconds, 1),
+        "preselect_seconds": round(preselect_seconds, 1),
+    }
+    log.info(
+        "Univers large: "
+        f"{len(monitored_tickers)} surveilles, {len(ranked)} preselectionnables, "
+        f"{len(universe_quotes)} shortlist, regions {shortlist_region_counts}, {elapsed:.1f}s"
+    )
+    return universe_quotes, histories, meta
 
 
 def _fetch_histories(tickers: list[str], period: str = "3mo") -> dict[str, pd.DataFrame]:
@@ -656,7 +933,7 @@ def load_daily_universe_cache() -> list[dict] | None:
     return quotes if isinstance(quotes, list) and quotes else None
 
 
-def write_daily_universe_cache(quotes: list[dict]) -> None:
+def write_daily_universe_cache(quotes: list[dict], meta: dict | None = None) -> None:
     write_cache(
         DAILY_UNIVERSE_KEY,
         {
@@ -665,6 +942,7 @@ def write_daily_universe_cache(quotes: list[dict]) -> None:
             "quotes": quotes,
             "tickers": [q.get("symbol") for q in quotes if q.get("symbol")],
             "size": len(quotes),
+            "meta": meta or {},
         },
     )
 
@@ -699,14 +977,16 @@ def enrich_quote_from_history(quote: dict, hist: pd.DataFrame) -> dict:
 def get_daily_universe(spy_hist: pd.DataFrame, force_rebuild: bool = False) -> tuple[list[dict], dict[str, pd.DataFrame], dict]:
     cached_quotes = None if force_rebuild else load_daily_universe_cache()
     if cached_quotes:
+        cached_payload = (read_cache(DAILY_UNIVERSE_KEY) or {}).get("data", {})
+        cached_meta = cached_payload.get("meta") if isinstance(cached_payload, dict) else {}
         tickers = [str(q.get("symbol")).upper() for q in cached_quotes if q.get("symbol")]
         histories = _fetch_histories(tickers, "6mo")
         quotes = [enrich_quote_from_history(q, histories.get(str(q.get("symbol")).upper(), pd.DataFrame())) for q in cached_quotes]
-        meta = {"source": "cache", "date": _today_key(), "size": len(quotes)}
+        meta = {"source": "cache", "date": _today_key(), "size": len(quotes), **(cached_meta or {})}
         log.info(f"Univers journalier charge depuis cache — {len(quotes)} actions")
         return quotes, histories, meta
 
-    discovered_quotes, discovered_histories = build_candidate_universe(spy_hist)
+    discovered_quotes, discovered_histories, universe_build_meta = build_candidate_universe(spy_hist)
     compact_quotes = []
     for q in discovered_quotes:
         symbol = str(q.get("symbol") or "").upper()
@@ -720,13 +1000,17 @@ def get_daily_universe(spy_hist: pd.DataFrame, force_rebuild: bool = False) -> t
                 "marketCap": q.get("marketCap") or q.get("intradaymarketcap"),
                 "averageDailyVolume3Month": q.get("averageDailyVolume3Month") or q.get("averageDailyVolume10Day"),
                 "fullExchangeName": q.get("fullExchangeName") or q.get("exchange"),
+                "currency": q.get("currency") or infer_currency(symbol),
+                "market_region": q.get("market_region") or infer_market_region(symbol),
+                "_pre_score": q.get("_pre_score"),
+                "_sources": q.get("_sources") or [],
                 "_source": q.get("_source") or "screen",
             }
         )
-    write_daily_universe_cache(compact_quotes)
+    write_daily_universe_cache(compact_quotes, universe_build_meta)
     histories = discovered_histories or _fetch_histories([q["symbol"] for q in compact_quotes], "6mo")
     quotes = [enrich_quote_from_history(q, histories.get(q["symbol"], pd.DataFrame())) for q in compact_quotes]
-    meta = {"source": "rebuild", "date": _today_key(), "size": len(quotes)}
+    meta = {"source": "rebuild", "date": _today_key(), "size": len(quotes), **universe_build_meta}
     log.info(f"Univers journalier reconstruit — {len(quotes)} actions")
     return quotes, histories, meta
 
@@ -804,6 +1088,8 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
     ticker = str(quote.get("symbol", "")).upper()
     name = str(quote.get("shortName") or quote.get("longName") or ticker)
     source = quote.get("_source", "screen")
+    market_region = quote.get("market_region") or infer_market_region(ticker)
+    market_session = infer_market_session(ticker)
 
     # Defensive: flatten MultiIndex columns if still present
     if not hist.empty and isinstance(hist.columns, pd.MultiIndex):
@@ -840,6 +1126,7 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
     closes = _to_series(hist["Close"]) if has_hist else pd.Series(dtype=float)
     has_hist = has_hist and len(closes) >= 30
     hist_vol = _to_series(hist["Volume"]) if has_hist and "Volume" in hist.columns else pd.Series(dtype=float)
+    last_market_timestamp, last_observed_price = latest_market_observation(hist)
 
     if pd.isna(avg_vol) and len(hist_vol) >= 20:
         avg_vol = float(hist_vol.tail(50).mean())
@@ -852,13 +1139,28 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
         return None
     if pd.isna(market_cap) or market_cap < MIN_MARKET_CAP:
         return None
-    if pd.isna(avg_vol) or avg_vol < MIN_AVG_VOLUME:
+    min_avg_volume = EUROPE_MIN_AVG_VOLUME if market_region == "Europe" else MIN_AVG_VOLUME
+    if pd.isna(avg_vol) or avg_vol < min_avg_volume:
         return None
     if len(closes) < MIN_HISTORY_DAYS:
         return None
 
     volume_ratio = (volume / avg_vol) if not pd.isna(volume) and not pd.isna(avg_vol) and avg_vol > 0 else None
     dist_ma20_pct = ((price - twenty_day) / twenty_day * 100) if not pd.isna(twenty_day) and twenty_day > 0 else None
+    range_compression = None
+    near_ma20_recent = False
+    if has_hist and "High" in hist.columns and "Low" in hist.columns and len(hist) >= 20:
+        h_high_tmp = _to_series(hist["High"])
+        h_low_tmp = _to_series(hist["Low"])
+        if len(h_high_tmp) >= 20 and len(h_low_tmp) >= 20 and price > 0:
+            last5_range = float((h_high_tmp.iloc[-5:].max() - h_low_tmp.iloc[-5:].min()) / price * 100)
+            atr20 = float((h_high_tmp - h_low_tmp).rolling(20).mean().iloc[-1] / price * 100)
+            if atr20 > 0:
+                range_compression = last5_range / (atr20 * 5)
+    if has_hist and len(closes) >= 25:
+        ma20_series = closes.rolling(20).mean()
+        recent_dist = ((closes.tail(8) - ma20_series.tail(8)) / ma20_series.tail(8) * 100).dropna()
+        near_ma20_recent = bool((recent_dist.abs() <= 4).any()) if not recent_dist.empty else False
 
     # ==================================================================
     # BLOC TENDANCE (max 3.0)
@@ -913,10 +1215,12 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
             b_momentum += 1.0
             signals.append(f"RSI sain ({rsi_val})")
             why_selected.append("RSI dans une zone saine")
-        elif 65 < rsi_val <= 75:
-            b_momentum += 0.4
-            signals.append(f"RSI fort ({rsi_val})")
-        # RSI > 75 géré dans le bloc risque ci-dessous
+        elif 65 < rsi_val <= 70:
+            b_momentum += 0.2
+            signals.append(f"RSI ferme ({rsi_val})")
+        elif 70 < rsi_val <= 75:
+            signals.append(f"RSI tendu ({rsi_val})")
+        # RSI > 70 est surtout traite comme un risque de timing ci-dessous
 
         macd_raw = calc_macd_signal(closes)
         macd_label = {
@@ -964,11 +1268,19 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
             signals.append("RS+ SPY 1m+3m")
             why_selected.append("surperformance vs SPY sur 1m et 3m")
         if rs_1m is not None and rs_1m > 5:
-            b_strength += 0.4
+            b_strength += 0.7
+            signals.append("RS 1m forte")
+            why_selected.append("force relative 1m superieure a 5 points")
+        elif rs_1m is not None and rs_1m <= 0:
+            b_strength -= 1.8
+            risk_flags.append("force relative 1m negative vs SPY")
         if rs_3m is not None and rs_3m > 10:
             b_strength += 0.3
+        elif rs_3m is not None and rs_3m < 0:
+            b_strength -= 0.8
+            risk_flags.append("force relative 3m negative vs SPY")
 
-    b_strength = min(b_strength, 2.0)
+    b_strength = max(min(b_strength, 2.0), -2.2)
 
     # ==================================================================
     # BLOC RISQUE (ajustements négatifs)
@@ -982,17 +1294,31 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
         "neutre": "— Neutre",
     }.get(boll_raw, "—")
 
-    if has_hist and rsi_val is not None and rsi_val > 75:
-        # Contextuel : malus fort si le prix est aussi très éloigné de la MA20
+    if has_hist and rsi_val is not None and rsi_val > 70:
         ma20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else float("nan")
-        if not pd.isna(ma20) and ma20 > 0 and (price - ma20) / ma20 > 0.15:
-            b_risk -= 1.2   # Extension ET RSI extrême → vrai signal de surachat
+        if rsi_val > 75 and not pd.isna(ma20) and ma20 > 0 and (price - ma20) / ma20 > 0.15:
+            b_risk -= 1.6
             signals.append(f"RSI suracheté+extension ({rsi_val})")
             risk_flags.append("RSI tres eleve avec prix etire")
+        elif rsi_val > 75:
+            b_risk -= 1.0
+            signals.append(f"RSI suracheté ({rsi_val})")
+            risk_flags.append("RSI tres eleve")
         else:
-            b_risk -= 0.4   # RSI élevé mais pas encore en extension : malus léger
-            signals.append(f"RSI élevé ({rsi_val})")
-            risk_flags.append("RSI eleve")
+            b_risk -= 0.45
+            signals.append(f"RSI tendu ({rsi_val})")
+            risk_flags.append("RSI superieur a 70")
+
+    if dist_ma20_pct is not None:
+        if dist_ma20_pct > 20:
+            b_risk -= 1.5
+            risk_flags.append("prix tres etire vs MA20")
+        elif dist_ma20_pct > 15:
+            b_risk -= 1.0
+            risk_flags.append("prix etire >15% vs MA20")
+        elif dist_ma20_pct > 10:
+            b_risk -= 0.45
+            risk_flags.append("prix etire >10% vs MA20")
 
     if boll_raw == "extension":
         if rsi_val is not None and rsi_val > 70:
@@ -1025,19 +1351,32 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
         # C'est là qu'on entre, pas quand elle est à +25% au-dessus
         if ma20 > 0:
             dist_pct = (price - ma20) / ma20 * 100
-            if 0 <= dist_pct < 3:
-                b_setup += 1.2
+            trend_constructive = b_trend >= 1.5 and not pd.isna(fifty_day) and price > fifty_day
+            if -1 <= dist_pct < 3 and trend_constructive:
+                b_setup += 1.7
                 setup_label = "pullback MA20"
                 signals.append("setup: pullback MA20 ✓")
-                why_selected.append("pullback proche de la MA20")
-            elif 3 <= dist_pct < 7:
-                b_setup += 0.6
+                why_selected.append("pullback propre proche de la MA20")
+            elif 0 <= dist_pct < 3:
+                b_setup += 1.1
+                setup_label = "pullback MA20"
+                signals.append("setup: pullback MA20 ✓")
+                why_selected.append("prix proche de la MA20")
+            elif 3 <= dist_pct < 7 and trend_constructive:
+                b_setup += 0.8
                 setup_label = "léger écart MA20"
-            elif 7 <= dist_pct < 15:
-                b_setup += 0.0   # neutre
+            elif 3 <= dist_pct < 7:
+                b_setup += 0.4
+                setup_label = "léger écart MA20"
+            elif 7 <= dist_pct < 10:
+                b_setup += 0.0
                 setup_label = "écarté MA20"
+            elif 10 <= dist_pct < 15:
+                b_setup -= 0.3
+                setup_label = "étiré MA20"
+                risk_flags.append("point entree moins favorable")
             elif dist_pct >= 15:
-                b_setup -= 0.6   # trop étiré, entrée risquée
+                b_setup -= 0.9
                 setup_label = "étiré MA20"
                 signals.append("setup: trop loin MA20 ✗")
                 risk_flags.append("prix trop etire vs MA20")
@@ -1068,17 +1407,12 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
         # Une action qui fait une "pause" en range étroit avant un move
         # est plus intéressante qu'une action qui part dans tous les sens
         if "High" in hist.columns and "Low" in hist.columns and len(hist) >= 20:
-            h_high = _to_series(hist["High"])
-            h_low = _to_series(hist["Low"])
-            last5_range = float((h_high.iloc[-5:].max() - h_low.iloc[-5:].min()) / price * 100)
-            atr20 = float((h_high - h_low).rolling(20).mean().iloc[-1] / price * 100)
-            if atr20 > 0:
-                compression = last5_range / (atr20 * 5)   # < 0.5 = range comprimé
-                if compression < 0.4:
+            if range_compression is not None:
+                if range_compression < 0.4:
                     b_setup += 0.5
                     signals.append("setup: range comprimé ✓")
                     why_selected.append("range court terme comprime")
-                elif compression < 0.6:
+                elif range_compression < 0.6:
                     b_setup += 0.2
 
     b_setup = max(min(b_setup, 2.0), -1.0)
@@ -1103,12 +1437,25 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
     pullback_score = 0.0
     if not pd.isna(week_high) and week_high > 0 and price / week_high >= 0.92:
         breakout_score += 2.0
+    breakout_has_confirmation = False
     if volume_ratio is not None and volume_ratio >= 1.3:
         breakout_score += 1.0
+        breakout_has_confirmation = True
+    if range_compression is not None and range_compression < 0.6:
+        breakout_has_confirmation = True
+    if near_ma20_recent:
+        breakout_has_confirmation = True
     if macd_label.startswith("🟢"):
         breakout_score += 1.0
     if rs_1m is not None and rs_1m > 5:
         breakout_score += 1.0
+    if breakout_score >= 2.0 and not breakout_has_confirmation:
+        breakout_score -= 1.2
+        b_risk -= 0.5
+        risk_flags.append("breakout non confirme par volume/consolidation")
+
+    raw = b_trend + b_momentum + b_strength + b_setup + b_risk
+    score_final = round(min(max(raw, 0.0), 10.0), 1)
 
     trend_score = b_trend + max(b_strength, 0) * 0.6
     if rs_1m is not None and rs_1m > 0:
@@ -1138,12 +1485,21 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
         "Nom": name,
         "Ticker": ticker,
         "Source": source,
+        "market_region": market_region,
+        "market_session": market_session,
+        "last_market_timestamp": last_market_timestamp,
+        "last_observed_price": round(last_observed_price, 4) if last_observed_price is not None else None,
+        "regular_price": round(price, 4),
+        "prepost_price": None,
+        "prepost_change": None,
+        "Currency": quote.get("currency") or infer_currency(ticker),
         "Cours": round(price, 2),
         "Variation (%)": round(day_change, 2),
         "Capitalisation": _format_money(market_cap) if not pd.isna(market_cap) else "-",
         "cap_raw": market_cap if not pd.isna(market_cap) else 0.0,
         "Volume": _format_vol(volume) if not pd.isna(volume) else "-",
         "Score": score_final,
+        "Opportunity_Adjustment": round(b_setup + b_risk + min(b_strength, 0), 1),
         "B_Tendance": round(b_trend, 1),
         "B_Momentum": round(b_momentum, 1),
         "B_Force": round(b_strength, 1),
@@ -1211,6 +1567,7 @@ def job_score_stocks() -> None:
             log.warning("job_score_stocks — univers vide")
             return
 
+        score_shortlist_started_at = datetime.now()
         results = []
         for quote in universe_quotes:
             ticker = str(quote.get("symbol", "")).upper()
@@ -1218,6 +1575,12 @@ def job_score_stocks() -> None:
             row = _score_stock(quote, hist, spy_hist)
             if row:
                 results.append(row)
+        score_shortlist_seconds = (datetime.now() - score_shortlist_started_at).total_seconds()
+        log.info(
+            "TIMING score_shortlist "
+            f"seconds={score_shortlist_seconds:.1f} "
+            f"shortlist={len(universe_quotes)} scored={len(results)}"
+        )
 
         results.sort(key=lambda r: r["Score"], reverse=True)
 
@@ -1253,29 +1616,103 @@ def job_score_stocks() -> None:
         for idx, row in enumerate(results, start=1):
             row["Display_Rank"] = idx
 
+        news_context_stats = enrich_rows_with_news_context(results, engine="standard", limit=15)
+
         setup_counts: dict[str, int] = {}
+        region_counts: dict[str, int] = {}
         for row in results:
             setup = row.get("Setup_Type") or "trend"
             setup_counts[setup] = setup_counts.get(setup, 0) + 1
+            region = row.get("market_region") or "unknown"
+            region_counts[region] = region_counts.get(region, 0) + 1
         meta = {
             "run_id": run_id,
             "calculated_at": calculated_at,
             "universe_date": universe_meta.get("date"),
             "universe_source": universe_meta.get("source"),
             "universe_size": universe_meta.get("size"),
+            "monitored_universe_size": universe_meta.get("monitored_universe_size"),
+            "scoring_shortlist_size": universe_meta.get("scoring_shortlist_size") or universe_meta.get("size"),
+            "monitored_region_counts": universe_meta.get("monitored_region_counts") or {},
+            "shortlist_region_counts": universe_meta.get("shortlist_region_counts") or {},
+            "source_counts": universe_meta.get("source_counts") or {},
+            "preselection_candidates": universe_meta.get("preselection_candidates"),
+            "universe_build_seconds": universe_meta.get("build_seconds"),
+            "build_monitored_seconds": universe_meta.get("build_monitored_seconds"),
+            "preselect_seconds": universe_meta.get("preselect_seconds"),
+            "score_shortlist_seconds": round(score_shortlist_seconds, 1),
             "scored_count": len(results),
             "confirmed_count": sum(1 for r in results if r.get("Confirmed")),
+            "new_observation_count": sum(1 for r in results if r.get("new_observation")),
             "setup_counts": setup_counts,
+            "region_counts": region_counts,
             "confirm_threshold": SIGNAL_CONFIRM_THRESHOLD,
             "confirm_cycles": SIGNAL_CONFIRM_CYCLES,
+            "news_context_enriched": news_context_stats.get("enriched", 0),
         }
         write_cache("stock_ideas", results)
         write_cache("stock_ideas_meta", meta)
+        tracking_stats = register_detected_signals(
+            "standard",
+            results,
+            run_id=run_id,
+            detected_at=calculated_at,
+        )
 
         top3 = " | ".join(f"{r['Ticker']} ({r['Score']})" for r in results[:3])
-        log.info(f"job_score_stocks — {len(results)} actions scorees. Top 3 : {top3}")
+        log.info(
+            f"job_score_stocks — {len(results)} actions scorees. Top 3 : {top3}. "
+            f"News context={news_context_stats.get('enriched', 0)}. "
+            f"Tracking inserted={tracking_stats['inserted']} skipped={tracking_stats['skipped']}"
+        )
     except Exception as e:
         log.error(f"job_score_stocks error: {e}", exc_info=True)
+
+
+def job_score_small_caps() -> None:
+    log.info("job_score_small_caps — debut")
+    try:
+        started_at = datetime.now()
+        results = scan_small_cap_opportunities()
+        elapsed = (datetime.now() - started_at).total_seconds()
+        news_context_stats = enrich_rows_with_news_context(results, engine="smallcap", limit=15)
+        meta = {
+            "duration_seconds": round(elapsed, 1),
+            "engine": "smallcap_explosive_momentum",
+            "philosophy": "momentum agressif, breakout, volume spike, risque eleve",
+            "news_context_enriched": news_context_stats.get("enriched", 0),
+        }
+        save_smallcap_results(results, meta=meta)
+        detected_at = getattr(scan_small_cap_opportunities, "last_meta", {}).get("calculated_at") or utc_now_iso()
+        tracking_stats = register_detected_signals(
+            "smallcap",
+            results,
+            run_id=detected_at,
+            detected_at=detected_at,
+        )
+        top3 = " | ".join(
+            f"{row.get('ticker')} ({row.get('Explosion_Score')})" for row in results[:3]
+        )
+        log.info(
+            "job_score_small_caps — "
+            f"{len(results)} opportunites sauvegardees en {elapsed:.1f}s. Top 3 : {top3 or '-'}. "
+            f"News context={news_context_stats.get('enriched', 0)}. "
+            f"Tracking inserted={tracking_stats['inserted']} skipped={tracking_stats['skipped']}"
+        )
+    except Exception as e:
+        log.error(f"job_score_small_caps error: {e}", exc_info=True)
+
+
+def job_track_signal_outcomes() -> None:
+    log.info("job_track_signal_outcomes — debut")
+    try:
+        stats = update_signal_outcomes(fetch_histories_fn=_fetch_histories, limit=300)
+        log.info(
+            "job_track_signal_outcomes — "
+            f"pending={stats['pending']} updated={stats['updated']} completed={stats['completed']}"
+        )
+    except Exception as e:
+        log.error(f"job_track_signal_outcomes error: {e}", exc_info=True)
 
 
 def job_score_sectors() -> None:
@@ -1378,11 +1815,14 @@ def job_weekend_maintenance() -> None:
 
 if __name__ == "__main__":
     log.info("Worker demarrage — 4 cores / 8 GB")
+    init_tracking_db()
 
     # Premier calcul immédiat au démarrage
     log.info("Calculs initiaux...")
     job_refresh_market()
     job_score_stocks()
+    job_score_small_caps()
+    job_track_signal_outcomes()
     job_score_sectors()
     job_morning_briefing()
     log.info("Calculs initiaux termines — scheduler en route")
@@ -1394,6 +1834,8 @@ if __name__ == "__main__":
 
     scheduler.add_job(job_refresh_market, "interval", minutes=5, id="refresh_market")
     scheduler.add_job(job_score_stocks, "interval", minutes=30, id="score_stocks")
+    scheduler.add_job(job_score_small_caps, "interval", minutes=7, id="score_small_caps")
+    scheduler.add_job(job_track_signal_outcomes, "interval", minutes=60, id="track_signal_outcomes")
     scheduler.add_job(job_score_sectors, "interval", minutes=60, id="score_sectors")
     scheduler.add_job(job_morning_briefing, "cron", hour=7, minute=0, id="morning_briefing")
     scheduler.add_job(job_evening_snapshot, "cron", hour=18, minute=0, id="evening_snapshot")

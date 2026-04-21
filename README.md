@@ -72,21 +72,20 @@ La page `Marche du jour` donne une vision rapide de contexte :
 
 ### Analyse
 
-La page `Analyse` regroupe trois blocs :
+La page `Analyse` est centree sur les recommandations d'actions :
 
-- `A la une` : meilleurs gagnants/perdants de grandes capitalisations US ;
-- `Valeurs a fort potentiel` : recommandations d'actions issues du worker ;
-- `Fiche entreprise` : analyse detaillee d'une societe.
+- `Signaux stables` : recommandations prudentes issues du moteur standard ;
+- `Small caps explosives` : scanner momentum plus speculatif ;
+- `Suivi des signaux` : comparaison objective des performances futures des signaux detectes.
 
-La fiche entreprise affiche notamment :
+Le suivi des signaux affiche notamment :
 
-- prix, variation recente et sentiment marche ;
-- ratios de valorisation : PER, Price/Sales, EV/EBITDA ;
-- marges, croissance, free cash-flow, dette, cash ;
-- dividende, beta, objectifs analystes quand disponibles ;
-- lecture qualitative : valorisation, croissance, risque ;
-- comparaison de pairs ;
-- actualites recentes de l'actif.
+- nombre de signaux suivis ;
+- performances moyennes J+1, J+3 et J+5 ;
+- taux de signaux positifs ;
+- run-up moyen ;
+- drawdown moyen ;
+- meilleurs setups recents quand assez de donnees existent.
 
 ### Actualites
 
@@ -420,10 +419,12 @@ OPENAI_SCRIPT_MODEL=gpt-4o-mini
 .
 ├── app.py                         # Application Streamlit et commandes email
 ├── worker.py                      # Worker de scoring et caches marche
+├── market_universe.py             # Univers Europe, regions et sessions de marche
 ├── cache.py                       # Lecture/ecriture JSON dans data/cache
 ├── requirements.txt
 ├── docs/
-│   └── ameliorations.md
+│   ├── recommendation_signals.md
+│   └── news_digest.md
 ├── deploy/
 │   ├── streamlit-app.service
 │   ├── worker.service
