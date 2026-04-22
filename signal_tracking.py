@@ -14,6 +14,7 @@ import yfinance as yf
 BASE_DIR = Path(__file__).resolve().parent
 SIGNALS_DB_PATH = BASE_DIR / "data" / "signals.sqlite3"
 TRACKING_HORIZONS = (1, 3, 5)
+MAX_TRACKED_SIGNALS_PER_ENGINE_DAY = 10
 
 log = logging.getLogger("signal_tracking")
 
@@ -65,6 +66,7 @@ def _normalize_history_frame(df: pd.DataFrame, ticker: str | None = None) -> pd.
     result = df.copy()
     if isinstance(result.columns, pd.MultiIndex):
         target = str(ticker or "").upper()
+        matched_target = False
         if target:
             for level in range(result.columns.nlevels):
                 match = None
@@ -75,9 +77,12 @@ def _normalize_history_frame(df: pd.DataFrame, ticker: str | None = None) -> pd.
                 if match is not None:
                     try:
                         result = result.xs(match, axis=1, level=level, drop_level=True)
+                        matched_target = True
                         break
                     except Exception:
                         pass
+            if not matched_target:
+                return pd.DataFrame()
         if isinstance(result.columns, pd.MultiIndex):
             price_labels = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
             for level in range(result.columns.nlevels):
@@ -249,11 +254,13 @@ def register_detected_signals(
     run_id: str | None = None,
     detected_at: str | None = None,
     db_path: Path = SIGNALS_DB_PATH,
+    max_per_day: int = MAX_TRACKED_SIGNALS_PER_ENGINE_DAY,
 ) -> dict[str, int]:
     init_tracking_db(db_path)
     detected_at = detected_at or utc_now_iso()
     inserted = 0
     skipped = 0
+    capped = 0
     payloads = []
     for row in rows:
         if engine == "standard":
@@ -265,8 +272,28 @@ def register_detected_signals(
         if payload:
             payloads.append(payload)
 
+    payloads.sort(
+        key=lambda payload: (
+            int(payload.get("rank") or 999_999),
+            -float(payload.get("score") or 0),
+            str(payload.get("ticker") or ""),
+        )
+    )
+
     with sqlite3.connect(db_path) as conn:
         for payload in payloads:
+            observation_day = str(payload["observation_key"]).rsplit(":", 1)[-1]
+            tracked_today = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM tracked_signals
+                WHERE engine = ? AND observation_key LIKE ?
+                """,
+                (payload["engine"], f"{payload['engine']}:%:{observation_day}"),
+            ).fetchone()[0]
+            if max_per_day > 0 and tracked_today >= max_per_day:
+                capped += 1
+                continue
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO tracked_signals (
@@ -307,7 +334,7 @@ def register_detected_signals(
                 )
             else:
                 skipped += 1
-    return {"inserted": inserted, "skipped": skipped, "seen": len(payloads)}
+    return {"inserted": inserted, "skipped": skipped, "capped": capped, "seen": len(payloads)}
 
 
 def _daily_frame_after_signal(hist: pd.DataFrame, signal_at: str) -> pd.DataFrame:
@@ -373,14 +400,27 @@ def update_signal_outcomes(
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
+            WITH eligible_signals AS (
+                SELECT signal_id
+                FROM (
+                    SELECT signal_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY engine, substr(observation_key, -10)
+                               ORDER BY COALESCE(rank, 999999), COALESCE(score, 0) DESC, signal_id
+                           ) AS tracking_rank
+                    FROM tracked_signals
+                )
+                WHERE tracking_rank <= ?
+            )
             SELECT s.*, o.perf_1d_pct, o.perf_3d_pct, o.perf_5d_pct, o.followup_complete
             FROM tracked_signals s
             JOIN signal_outcomes o ON o.signal_id = s.signal_id
+            JOIN eligible_signals e ON e.signal_id = s.signal_id
             WHERE COALESCE(o.followup_complete, 0) = 0
             ORDER BY s.detected_at ASC
             LIMIT ?
             """,
-            (limit,),
+            (MAX_TRACKED_SIGNALS_PER_ENGINE_DAY, limit),
         ).fetchall()
 
     if not rows:
@@ -441,6 +481,19 @@ def summarize_signal_outcomes(
         conn.row_factory = sqlite3.Row
         total_rows = conn.execute(
             """
+            WITH eligible_signals AS (
+                SELECT signal_id
+                FROM (
+                    SELECT signal_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY engine, substr(observation_key, -10)
+                               ORDER BY COALESCE(rank, 999999), COALESCE(score, 0) DESC, signal_id
+                           ) AS tracking_rank
+                    FROM tracked_signals
+                    WHERE detected_at >= ?
+                )
+                WHERE tracking_rank <= ?
+            )
             SELECT s.engine AS engine,
                    COUNT(*) AS total,
                    AVG(o.perf_1d_pct) AS avg_1d,
@@ -454,27 +507,41 @@ def summarize_signal_outcomes(
                    SUM(CASE WHEN o.followup_complete THEN 1 ELSE 0 END) AS complete
             FROM tracked_signals s
             JOIN signal_outcomes o ON o.signal_id = s.signal_id
-            WHERE s.detected_at >= ?
+            JOIN eligible_signals e ON e.signal_id = s.signal_id
             GROUP BY s.engine
             ORDER BY s.engine
             """,
-            (cutoff,),
+            (cutoff, MAX_TRACKED_SIGNALS_PER_ENGINE_DAY),
         ).fetchall()
         setup_rows = conn.execute(
             """
+            WITH eligible_signals AS (
+                SELECT signal_id
+                FROM (
+                    SELECT signal_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY engine, substr(observation_key, -10)
+                               ORDER BY COALESCE(rank, 999999), COALESCE(score, 0) DESC, signal_id
+                           ) AS tracking_rank
+                    FROM tracked_signals
+                    WHERE detected_at >= ?
+                )
+                WHERE tracking_rank <= ?
+            )
             SELECT s.engine, COALESCE(s.setup, '-') AS setup, COUNT(*) AS total,
                    AVG(o.perf_5d_pct) AS avg_5d,
                    AVG(o.max_runup_pct) AS avg_runup,
                    AVG(CASE WHEN o.perf_5d_pct > 0 THEN 1.0 WHEN o.perf_5d_pct IS NOT NULL THEN 0.0 END) AS win_5d
             FROM tracked_signals s
             JOIN signal_outcomes o ON o.signal_id = s.signal_id
-            WHERE s.detected_at >= ? AND o.perf_5d_pct IS NOT NULL
+            JOIN eligible_signals e ON e.signal_id = s.signal_id
+            WHERE o.perf_5d_pct IS NOT NULL
             GROUP BY s.engine, s.setup
             HAVING COUNT(*) >= 2
             ORDER BY avg_5d DESC
             LIMIT 10
             """,
-            (cutoff,),
+            (cutoff, MAX_TRACKED_SIGNALS_PER_ENGINE_DAY),
         ).fetchall()
 
     def clean(row: sqlite3.Row) -> dict:

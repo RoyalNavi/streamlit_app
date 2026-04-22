@@ -135,6 +135,7 @@ def _normalize_history_frame(df: pd.DataFrame, ticker: str | None = None) -> pd.
     result = df.copy()
     if isinstance(result.columns, pd.MultiIndex):
         target = str(ticker or "").upper()
+        matched_target = False
         if target:
             for level in range(result.columns.nlevels):
                 match = None
@@ -145,9 +146,12 @@ def _normalize_history_frame(df: pd.DataFrame, ticker: str | None = None) -> pd.
                 if match is not None:
                     try:
                         result = result.xs(match, axis=1, level=level, drop_level=True)
+                        matched_target = True
                         break
                     except Exception:
                         pass
+            if not matched_target:
+                return pd.DataFrame()
 
         if isinstance(result.columns, pd.MultiIndex):
             price_labels = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
