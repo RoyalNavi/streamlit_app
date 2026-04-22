@@ -6658,7 +6658,8 @@ def normalize_changedz_rates_frame(rows: list[dict]) -> pd.DataFrame:
         "Officiel achat", "Officiel vente", "Taux", "Valeur", "Mis a jour", "Date",
     ]
     preferred = [column for column in preferred_order if column in frame.columns]
-    others = [column for column in frame.columns if column not in preferred]
+    hidden_raw_columns = {"parallel", "official"}
+    others = [column for column in frame.columns if column not in preferred and str(column).strip().lower() not in hidden_raw_columns]
     return frame[preferred + others]
 
 
@@ -6706,8 +6707,8 @@ def render_change_rates_section() -> None:
     ]
     for _, row in rates_frame.head(3).iterrows():
         label = str(row.get("Devise") or row.get("Nom") or "Devise")
-        value = row.get("Vente", row.get("Achat", row.get("Taux", row.get("Valeur", "-"))))
-        summary_items.append({"label": label, "value": value, "hint": "taux principal", "tone": "success"})
+        value = row.get("Vente", row.get("Taux", row.get("Valeur", "-")))
+        summary_items.append({"label": label, "value": value, "hint": "prix de vente", "tone": "success"})
     render_summary_strip("Lecture change", summary_items)
 
     displayed_frame = rates_frame.copy()
