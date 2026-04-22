@@ -260,6 +260,283 @@ load_local_env_file()
 st.set_page_config(page_title="Rafik Moulouel", layout="wide")
 
 
+APP_CSS = """
+<style>
+:root {
+    --app-bg: #f6f8fb;
+    --app-surface: #ffffff;
+    --app-surface-soft: #f8fafc;
+    --app-border: #dbe3ef;
+    --app-border-soft: #edf2f7;
+    --app-text: #111827;
+    --app-muted: #64748b;
+    --app-accent: #0f766e;
+    --app-accent-strong: #0f5f59;
+    --app-blue: #2563eb;
+    --app-green: #15803d;
+    --app-red: #b91c1c;
+    --app-amber: #a16207;
+    --app-radius: 8px;
+    --app-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+}
+
+.stApp {
+    background: var(--app-bg);
+    color: var(--app-text);
+}
+
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 3rem;
+    max-width: 1480px;
+}
+
+h1, h2, h3 {
+    letter-spacing: 0;
+    color: var(--app-text);
+}
+
+h1 {
+    font-size: 2.05rem;
+    line-height: 1.12;
+    margin-bottom: 0.35rem;
+}
+
+h2, h3 {
+    margin-top: 1.2rem;
+}
+
+p, li, span, label {
+    letter-spacing: 0;
+}
+
+div[data-testid="stCaptionContainer"] {
+    color: var(--app-muted);
+}
+
+.app-hero {
+    background: linear-gradient(135deg, #ffffff 0%, #f8fafc 58%, #ecfdf5 100%);
+    border: 1px solid var(--app-border);
+    border-radius: var(--app-radius);
+    padding: 22px 24px;
+    box-shadow: var(--app-shadow);
+    margin-bottom: 14px;
+}
+
+.app-hero-kicker {
+    color: var(--app-accent);
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+
+.app-hero-title {
+    color: var(--app-text);
+    font-size: 2rem;
+    font-weight: 850;
+    line-height: 1.12;
+    margin: 0;
+}
+
+.app-hero-copy {
+    color: #334155;
+    font-size: 1rem;
+    line-height: 1.5;
+    max-width: 780px;
+    margin-top: 10px;
+}
+
+.app-source-note {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    color: var(--app-muted);
+    padding: 14px 16px;
+    min-height: 92px;
+}
+
+.section-heading {
+    margin: 24px 0 12px;
+}
+
+.section-heading-title {
+    color: var(--app-text);
+    font-size: 1.28rem;
+    font-weight: 850;
+    line-height: 1.18;
+    margin: 0;
+}
+
+.section-heading-copy {
+    color: var(--app-muted);
+    font-size: 0.94rem;
+    line-height: 1.45;
+    margin-top: 5px;
+    max-width: 920px;
+}
+
+div[data-testid="stMetric"] {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    padding: 14px 16px;
+    box-shadow: 0 6px 16px rgba(15, 23, 42, 0.04);
+    min-height: 92px;
+}
+
+div[data-testid="stMetricLabel"] p {
+    color: var(--app-muted);
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+div[data-testid="stMetricValue"] {
+    color: var(--app-text);
+    font-weight: 800;
+}
+
+div[data-testid="stMetricDelta"] {
+    font-weight: 700;
+}
+
+div[data-testid="stDataFrame"],
+div[data-testid="stTable"] {
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    overflow: hidden;
+    box-shadow: 0 5px 16px rgba(15, 23, 42, 0.035);
+}
+
+div[data-testid="stExpander"] {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    box-shadow: 0 5px 16px rgba(15, 23, 42, 0.03);
+}
+
+div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    gap: 6px;
+    border-bottom: 1px solid var(--app-border);
+}
+
+div[data-testid="stTabs"] [data-baseweb="tab"] {
+    border-radius: 8px 8px 0 0;
+    padding: 10px 14px;
+    color: var(--app-muted);
+    font-weight: 700;
+}
+
+div[data-testid="stTabs"] [aria-selected="true"] {
+    color: var(--app-accent-strong);
+    background: #ecfdf5;
+}
+
+div[data-testid="stRadio"] [role="radiogroup"] {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border);
+    border-radius: var(--app-radius);
+    padding: 5px;
+    box-shadow: 0 5px 16px rgba(15, 23, 42, 0.035);
+}
+
+div[data-testid="stRadio"] label {
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-weight: 700;
+}
+
+.stButton > button,
+button[kind="primary"],
+button[kind="secondary"] {
+    border-radius: var(--app-radius);
+    border: 1px solid var(--app-border);
+    font-weight: 750;
+}
+
+.stButton > button:hover {
+    border-color: var(--app-accent);
+    color: var(--app-accent-strong);
+}
+
+div[data-baseweb="select"] > div,
+div[data-baseweb="input"] > div,
+textarea {
+    border-radius: var(--app-radius);
+}
+
+.element-container:has(.stPlotlyChart) {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    padding: 8px;
+    box-shadow: 0 5px 16px rgba(15, 23, 42, 0.035);
+}
+
+div[data-testid="stVerticalBlock"] > div:has(> .news-card) {
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    padding: 14px;
+    background: var(--app-surface);
+    box-shadow: 0 5px 16px rgba(15, 23, 42, 0.035);
+}
+
+.news-card-title {
+    font-size: 1.02rem;
+    line-height: 1.28;
+    font-weight: 800;
+    margin: 0 0 6px;
+}
+
+.news-card-title a {
+    color: var(--app-text);
+    text-decoration: none;
+}
+
+.news-card-title a:hover {
+    color: var(--app-accent-strong);
+}
+
+.news-card-meta {
+    color: var(--app-muted);
+    font-size: 0.8rem;
+    font-weight: 650;
+    margin-bottom: 8px;
+}
+
+.news-card-summary {
+    color: #334155;
+    font-size: 0.92rem;
+    line-height: 1.45;
+    margin: 0;
+}
+</style>
+"""
+
+
+def inject_global_styles() -> None:
+    """Centralise the lightweight visual system for the Streamlit UI."""
+    st.markdown(APP_CSS, unsafe_allow_html=True)
+
+
+inject_global_styles()
+
+
+def render_section_heading(title: str, description: str | None = None) -> None:
+    description_markup = ""
+    if description:
+        description_markup = f"<div class='section-heading-copy'>{escape(description)}</div>"
+    st.html(
+        f"""
+        <div class="section-heading">
+            <h2 class="section-heading-title">{escape(title)}</h2>
+            {description_markup}
+        </div>
+        """
+    )
+
+
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 VALID_ROLES = ("user", "admin")
 
@@ -2233,6 +2510,16 @@ def render_stable_recommendations_section() -> None:
     cached = read_cache("stock_ideas")
     cached_meta = read_cache("stock_ideas_meta")
     meta = cached_meta.get("data", {}) if cached_meta else {}
+    regime_payload = meta.get("market_regime") or {}
+    regime_adjustment = meta.get("market_regime_adjustment") or {}
+    regime_suffix = ""
+    if regime_payload.get("regime"):
+        regime_suffix = (
+            f" · regime {regime_payload.get('regime')}"
+            f" ({regime_payload.get('score', 0)})"
+        )
+        if regime_adjustment.get("adjusted"):
+            regime_suffix += f" · ajustements regime {regime_adjustment.get('adjusted')}"
     using_cache = cached is not None and cached.get("data")
 
     if using_cache:
@@ -2245,6 +2532,7 @@ def render_stable_recommendations_section() -> None:
                 f"· shortlist {meta.get('scoring_shortlist_size') or meta.get('universe_size', '?')} "
                 f"· scores {meta.get('scored_count', '?')} · "
                 f"{meta.get('confirmed_count', 0)} signal(s) confirme(s)"
+                f"{regime_suffix}"
             )
         elif age < 90:
             st.warning(f"🟡 Derniere analyse il y a {int(age)} min — le worker semble lent ou redemarrage en cours.")
@@ -2327,6 +2615,7 @@ def render_stable_recommendations_section() -> None:
         show_cols = [
             "Display_Rank", "Nom", "Ticker", "Setup_Type", "Confirmed", "Score",
             "Opportunity_Adjustment", "Raw_Score", "Age_Penalty",
+            "market_regime", "market_regime_adjustment",
             "market_region", "market_session", "new_observation", "last_market_timestamp",
             "Stability_Score", "Consecutive_Hits", "Recent_Top_Hits", "Signal_Age_Minutes",
             "Cours", "Variation (%)", "Capitalisation", "RSI", "MACD",
@@ -2359,6 +2648,8 @@ def render_stable_recommendations_section() -> None:
             "RSI": st.column_config.NumberColumn("RSI", format="%.0f"),
             "Setup_Type": st.column_config.TextColumn("Setup"),
             "Confirmed": st.column_config.TextColumn("Confirme"),
+            "market_regime": st.column_config.TextColumn("Regime"),
+            "market_regime_adjustment": st.column_config.NumberColumn("Ajust. regime", format="%+.2f"),
             "market_region": st.column_config.TextColumn("Region"),
             "market_session": st.column_config.TextColumn("Session"),
             "new_observation": st.column_config.TextColumn("Nouv. obs."),
@@ -2394,6 +2685,8 @@ def render_stable_recommendations_section() -> None:
             + f" · nouvelles observations {meta.get('new_observation_count', '-')}"
             + " · cycles confirmes uniquement sur nouvelle observation de marche"
         )
+        if regime_payload.get("reasons"):
+            st.caption("Regime marche : " + ", ".join(str(reason) for reason in regime_payload.get("reasons", [])[:6]))
 
     render_news_llm_actions(df, engine="standard")
 
@@ -2413,6 +2706,8 @@ def build_smallcap_display_frame(rows: list[dict]) -> pd.DataFrame:
     df["Market Cap"] = df["market_cap"].map(format_money) if "market_cap" in df.columns else "-"
     df["Volume affiche"] = df["volume"].map(format_large_number) if "volume" in df.columns else "-"
     df["Avg vol 20j"] = df["avg_volume_20d"].map(format_large_number) if "avg_volume_20d" in df.columns else "-"
+    if "smallcap_news_display" not in df.columns:
+        df["smallcap_news_display"] = df.get("smallcap_news_label", pd.Series(["-"] * len(df)))
     return df
 
 
@@ -2422,6 +2717,16 @@ def render_smallcap_opportunities_section() -> None:
     cached = read_cache("smallcap_ideas")
     cached_meta = read_cache("smallcap_ideas_meta")
     meta = cached_meta.get("data", {}) if cached_meta else {}
+    regime_payload = meta.get("market_regime") or {}
+    regime_adjustment = meta.get("market_regime_adjustment") or {}
+    regime_suffix = ""
+    if regime_payload.get("regime"):
+        regime_suffix = (
+            f" · regime {regime_payload.get('regime')}"
+            f" ({regime_payload.get('score', 0)})"
+        )
+        if regime_adjustment.get("adjusted"):
+            regime_suffix += f" · malus regime {regime_adjustment.get('adjusted')}"
 
     if not cached or not cached.get("data"):
         st.info(
@@ -2437,6 +2742,7 @@ def render_smallcap_opportunities_section() -> None:
             f"· candidats {meta.get('candidate_count', '?')} "
             f"· scores {meta.get('scored_count', '?')} "
             f"· duree {meta.get('duration_seconds', '?')}s"
+            f"{regime_suffix}"
         )
     elif age < 90:
         st.warning(f"Dernier scan small caps il y a {int(age)} min — donnees a rafraichir.")
@@ -2483,7 +2789,8 @@ def render_smallcap_opportunities_section() -> None:
 
     show_cols = [
         "rank", "Action", "price", "change_pct", "rel_volume", "Explosion_Score",
-        "setup", "risk", "context_label", "comment", "Tags", "last_market_timestamp",
+        "setup", "risk", "smallcap_news_display", "market_regime_adjustment",
+        "smallcap_news_summary", "comment", "Tags", "last_market_timestamp",
     ]
     advanced = st.toggle("Details techniques small caps", value=False, key="smallcap_advanced")
     if advanced:
@@ -2492,7 +2799,8 @@ def render_smallcap_opportunities_section() -> None:
             "Avg vol 20j", "rel_volume", "Explosion_Score", "rsi_14",
             "distance_from_ma20_pct", "close_vs_day_high", "volatility",
             "setup", "risk", "comment", "Tags", "market_session", "last_market_timestamp",
-            "last_observed_price", "context_label",
+            "last_observed_price", "context_label", "smallcap_news_label", "smallcap_news_display",
+            "smallcap_news_summary", "smallcap_news_adjustment", "market_regime", "market_regime_adjustment",
         ]
     display_cols = [col for col in show_cols if col in df.columns]
 
@@ -2512,6 +2820,12 @@ def render_smallcap_opportunities_section() -> None:
             "setup": st.column_config.TextColumn("Setup"),
             "risk": st.column_config.TextColumn("Risque"),
             "context_label": st.column_config.TextColumn("Contexte news"),
+            "smallcap_news_label": st.column_config.TextColumn("Label news"),
+            "smallcap_news_display": st.column_config.TextColumn("News small cap"),
+            "smallcap_news_summary": st.column_config.TextColumn("Resume news"),
+            "smallcap_news_adjustment": st.column_config.NumberColumn("Ajust. news", format="%+.2f"),
+            "market_regime": st.column_config.TextColumn("Regime"),
+            "market_regime_adjustment": st.column_config.NumberColumn("Ajust. regime", format="%+.2f"),
             "comment": st.column_config.TextColumn("Commentaire"),
             "Tags": st.column_config.TextColumn("Tags"),
             "last_market_timestamp": st.column_config.TextColumn("Derniere bougie"),
@@ -2537,10 +2851,12 @@ def render_smallcap_opportunities_section() -> None:
             f"· volume moyen min {format_large_number(filters.get('min_avg_volume'))}. "
             "Ce moteur assume RSI eleve, extension et absence de stabilite multi-cycles."
         )
+    if regime_payload.get("reasons"):
+        st.caption("Regime marche : " + ", ".join(str(reason) for reason in regime_payload.get("reasons", [])[:6]))
 
 
 def render_midcap_recommendations_section() -> None:
-    st.subheader("Valeurs a fort potentiel")
+    render_section_heading("Valeurs a fort potentiel", "Signaux classes par moteur, regime de marche et qualite du setup.")
     stable_tab, smallcap_tab = st.tabs(["Signaux stables", "Small caps explosives"])
     with stable_tab:
         st.caption("Moteur principal : signaux plus propres, confirmes et suivables.")
@@ -2555,7 +2871,7 @@ def render_midcap_recommendations_section() -> None:
 def render_signal_tracking_summary() -> None:
     from signal_tracking import summarize_signal_outcomes
 
-    st.subheader("Suivi des signaux")
+    render_section_heading("Suivi des signaux", "Lecture objective des performances futures des recommandations detectees.")
     try:
         summary = summarize_signal_outcomes(since_days=90)
     except Exception as exc:
@@ -2613,8 +2929,10 @@ def render_signal_tracking_summary() -> None:
 
 
 def render_market_movers_section(catalog: pd.DataFrame) -> None:
-    st.subheader("A la une")
-    st.caption("Un coup d'oeil rapide sur les grandes capitalisations des gros indices US, pas sur les petites valeurs speculatives.")
+    render_section_heading(
+        "A la une",
+        "Un coup d'oeil rapide sur les grandes capitalisations des gros indices US, pas sur les petites valeurs speculatives.",
+    )
 
     with st.spinner("Je charge les plus fortes variations du jour..."):
         try:
@@ -2698,12 +3016,12 @@ def render_market_movers_section(catalog: pd.DataFrame) -> None:
             <div style="
                 background:{background};
                 border:1px solid {accent};
-                border-radius:18px;
-                padding:18px 20px;
-                box-shadow:0 10px 24px rgba(15, 23, 42, 0.08);
-                min-height:420px;
+                border-radius:8px;
+                padding:16px 18px;
+                box-shadow:0 8px 22px rgba(15, 23, 42, 0.06);
+                min-height:360px;
             ">
-                <div style="font-size:0.88rem;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;color:{accent};">
+                <div style="font-size:0.8rem;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:{accent};">
                     {escape(title)}
                 </div>
                 <div style="margin-top:10px;font-size:0.96rem;color:#334155;">
@@ -2938,31 +3256,6 @@ def render_general_news_card(item: dict) -> None:
 
     st.markdown(
         """
-        <style>
-        div[data-testid="stVerticalBlock"] > div:has(> .news-card) {
-            border: 1px solid #e5e7eb;
-            border-radius: 8px;
-            padding: 12px;
-            background: #ffffff;
-        }
-        .news-card-title {
-            font-size: 1.02rem;
-            line-height: 1.28;
-            font-weight: 700;
-            margin: 0 0 6px;
-        }
-        .news-card-meta {
-            color: #64748b;
-            font-size: 0.8rem;
-            margin-bottom: 8px;
-        }
-        .news-card-summary {
-            color: #334155;
-            font-size: 0.92rem;
-            line-height: 1.45;
-            margin: 0;
-        }
-        </style>
         <div class="news-card"></div>
         """,
         unsafe_allow_html=True,
@@ -3289,6 +3582,49 @@ def get_briefing_output_dir(label: str | None = None) -> Path:
     path = BRIEFINGS_DIR / (safe_label or datetime.now().strftime("%Y-%m-%d"))
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def list_generated_podcasts(limit: int = 30) -> list[dict]:
+    if not BRIEFINGS_DIR.exists():
+        return []
+
+    podcasts: list[dict] = []
+    for audio_path in BRIEFINGS_DIR.glob("*/briefing.mp3"):
+        folder = audio_path.parent
+        try:
+            modified_at = audio_path.stat().st_mtime
+        except OSError:
+            continue
+
+        label = folder.name
+        parsed_label = label
+        try:
+            parsed_label = datetime.strptime(label, "%Y-%m-%d-%H%M%S").strftime("%d/%m/%Y %H:%M")
+        except ValueError:
+            pass
+
+        size_mb = 0.0
+        try:
+            size_mb = audio_path.stat().st_size / (1024 * 1024)
+        except OSError:
+            pass
+
+        script_path = folder / "script.md"
+        context_path = folder / "context.json"
+        podcasts.append(
+            {
+                "label": parsed_label,
+                "folder": label,
+                "audio_path": audio_path,
+                "script_path": script_path if script_path.exists() else None,
+                "context_path": context_path if context_path.exists() else None,
+                "modified_at": modified_at,
+                "size_mb": size_mb,
+            }
+        )
+
+    podcasts.sort(key=lambda item: item["modified_at"], reverse=True)
+    return podcasts[:limit]
 
 
 def compact_news_item(item: dict) -> dict:
@@ -5292,17 +5628,31 @@ def build_summary_table(
 
 
 def render_header(catalog: pd.DataFrame, cache_path: Path) -> None:
-    st.title("Comparateur Boursier Interactif")
-    st.caption(
-        "Recherche par nom d'entreprise ou d'indice, comparaison multi-actifs, evolution des prix et performances."
+    st.html(
+        """
+        <section class="app-hero">
+            <div class="app-hero-kicker">Dashboard finance</div>
+            <h1 class="app-hero-title">Comparateur Boursier Interactif</h1>
+            <div class="app-hero-copy">
+                Recherche par nom d'entreprise ou d'indice, comparaison multi-actifs,
+                evolution des prix, portefeuille simule, signaux et actualites marche.
+            </div>
+        </section>
+        """
     )
 
     last_refresh = time.strftime("%d/%m/%Y %H:%M", time.localtime(cache_path.stat().st_mtime))
     col1, col2, col3 = st.columns([1, 1, 2])
     col1.metric("Actifs repertories", f"{len(catalog):,}".replace(",", " "))
     col2.metric("Derniere mise a jour annuaire", last_refresh)
-    col3.caption(
-        "Sources : Nasdaq Trader pour les societes US, liste locale de grandes capitalisations europeennes, CoinGecko pour les cryptos, Yahoo Finance pour les prix."
+    col3.html(
+        """
+        <div class="app-source-note">
+            <strong>Sources</strong><br>
+            Nasdaq Trader pour les societes US, grandes capitalisations europeennes locales,
+            CoinGecko pour les cryptos, Yahoo Finance pour les prix.
+        </div>
+        """
     )
 
 
@@ -5449,8 +5799,10 @@ def render_company_profile_section(catalog: pd.DataFrame) -> None:
 
 
 def render_portfolio_section(catalog: pd.DataFrame, current_user: sqlite3.Row) -> None:
-    st.subheader("Portefeuille simule")
-    st.caption("Dis simplement combien tu veux investir dans un actif. L'app calcule la quantite et affiche la performance.")
+    render_section_heading(
+        "Portefeuille simule",
+        "Dis simplement combien tu veux investir dans un actif. L'app calcule la quantite et affiche la performance.",
+    )
 
     positions = list_portfolio_positions(current_user["username"])
     visible_assets = catalog[catalog["asset_type"].isin(["Entreprise", "Indice", "ETF", "Crypto"])].copy()
@@ -5675,8 +6027,10 @@ def render_portfolio_section(catalog: pd.DataFrame, current_user: sqlite3.Row) -
 
 
 def render_market_today_section(catalog: pd.DataFrame) -> None:
-    st.subheader("Marche du jour")
-    st.caption("Indices majeurs, stress de marche, taux, matieres premieres, crypto et dernieres nouvelles.")
+    render_section_heading(
+        "Marche du jour",
+        "Indices majeurs, stress de marche, taux, matieres premieres, crypto et dernieres nouvelles.",
+    )
 
     if st.button("Rafraichir le briefing marche", key="refresh_market_today"):
         download_price_histories.clear()
@@ -5734,7 +6088,7 @@ def render_market_today_section(catalog: pd.DataFrame) -> None:
         render_market_movers_section(catalog)
 
     with news_col:
-        st.subheader("News cles")
+        render_section_heading("News cles", "Derniers titres relies aux actifs de contexte.")
         try:
             news_items = fetch_news_for_tickers(("^GSPC", "^FCHI", "BTC-USD", "GC=F"), per_ticker_limit=4)
         except Exception:
@@ -5747,11 +6101,12 @@ def render_market_today_section(catalog: pd.DataFrame) -> None:
                 provider = item.get("provider") or "Source inconnue"
                 published = format_news_datetime(item.get("published_at"))
                 url = item.get("url")
-                if url:
-                    st.markdown(f"**[{title}]({url})**")
-                else:
-                    st.markdown(f"**{title}**")
-                st.caption(f"{item.get('ticker')} | {provider} | {published}")
+                with st.container(border=True):
+                    if url:
+                        st.markdown(f"**[{title}]({url})**")
+                    else:
+                        st.markdown(f"**{title}**")
+                    st.caption(f"{item.get('ticker')} | {provider} | {published}")
 
 
 def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
@@ -5791,19 +6146,9 @@ def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
             ],
             key="podcast_tone",
         )
-        include_portfolio = st.toggle("Inclure le portefeuille simule", value=True, key="podcast_include_portfolio")
-        include_market_context = st.toggle(
-            "Inclure un contexte marche dedie",
-            value=False,
-            key="podcast_include_market_context",
-            help="Desactive par defaut : les marches restent un sujet comme les autres dans le briefing generaliste.",
-        )
-        force_digest_rebuild = st.toggle(
-            "Reconstruire le digest editorial",
-            value=False,
-            key="podcast_force_digest_rebuild",
-            help="Sinon, un digest recent est reutilise pour stabiliser les podcasts generes a quelques minutes d'intervalle.",
-        )
+        include_portfolio = True
+        include_market_context = False
+        force_digest_rebuild = False
 
         if st.button("Generer le script du podcast", use_container_width=True):
             with st.spinner("Je collecte les infos, dedoublonne les sujets et prepare le script..."):
@@ -5948,6 +6293,35 @@ def render_podcast_briefing_controls(current_user: sqlite3.Row) -> None:
                 st.audio(str(audio_path))
                 st.caption(f"Fichier audio : {audio_path}")
 
+        old_podcasts = list_generated_podcasts()
+        if old_podcasts:
+            with st.expander("Anciens podcasts audio"):
+                selected_podcast_label = st.selectbox(
+                    "Podcast genere",
+                    options=[podcast["folder"] for podcast in old_podcasts],
+                    format_func=lambda folder: next(
+                        (
+                            f"{podcast['label']} · {podcast['size_mb']:.1f} Mo"
+                            for podcast in old_podcasts
+                            if podcast["folder"] == folder
+                        ),
+                        folder,
+                    ),
+                    key="podcast_history_select",
+                )
+                selected_podcast = next(
+                    (podcast for podcast in old_podcasts if podcast["folder"] == selected_podcast_label),
+                    old_podcasts[0],
+                )
+                st.audio(str(selected_podcast["audio_path"]))
+                st.caption(f"Dossier : {selected_podcast['folder']} | Fichier : {selected_podcast['audio_path']}")
+                if selected_podcast.get("script_path"):
+                    with st.expander("Voir le script associe"):
+                        try:
+                            st.markdown(selected_podcast["script_path"].read_text(encoding="utf-8"))
+                        except OSError:
+                            st.info("Script indisponible pour ce podcast.")
+
         if st.session_state.get("podcast_script"):
             st.divider()
             email_col, btn_col = st.columns([3, 1])
@@ -6033,8 +6407,10 @@ def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], cu
     general_tab, market_tab = st.tabs(["Infos generales", "News marche"])
 
     with market_tab:
-        st.subheader("Actualites marche")
-        st.caption("Flux recents par actif depuis Yahoo Finance. Utilise le bouton de rafraichissement pour recharger les news.")
+        render_section_heading(
+            "Actualites marche",
+            "Flux recents par actif depuis Yahoo Finance. Utilise le bouton de rafraichissement pour recharger les news.",
+        )
 
         if st.button("Rafraichir les actualites marche", key="refresh_news_button"):
             fetch_news_for_tickers.clear()
@@ -6076,17 +6452,19 @@ def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], cu
                     published = format_news_datetime(item["published_at"])
                     summary = item["summary"].strip()
 
-                    st.markdown(f"### {title}")
-                    st.caption(f"{name} ({ticker}) | Source : {provider} | {published}")
-                    if summary:
-                        st.write(summary)
-                    if url:
-                        st.markdown(f"[Ouvrir l'article]({url})")
-                    st.divider()
+                    with st.container(border=True):
+                        st.markdown(f"#### {title}")
+                        st.caption(f"{name} ({ticker}) | Source : {provider} | {published}")
+                        if summary:
+                            st.write(summary)
+                        if url:
+                            st.markdown(f"[Ouvrir l'article]({url})")
 
     with general_tab:
-        st.subheader("Infos generales")
-        st.caption("Actualites generalistes issues de plusieurs medias : presse nationale, chaines info et medias internationaux francophones.")
+        render_section_heading(
+            "Infos generales",
+            "Actualites generalistes issues de plusieurs medias : presse nationale, chaines info et medias internationaux francophones.",
+        )
 
         category = st.selectbox(
             "Rubrique",
@@ -6139,8 +6517,7 @@ def render_comparator_section(
     smooth_closures: bool,
     use_log_scale: bool,
 ) -> list[str]:
-    st.subheader("Comparateur")
-    st.caption("Compare plusieurs actions, indices, ETF ou cryptos avec les courbes de performance et de prix.")
+    render_section_heading("Comparateur", "Compare plusieurs actions, indices, ETF ou cryptos avec les courbes de performance et de prix.")
 
     visible_catalog = catalog[catalog["asset_type"].isin(asset_types)].copy()
     if visible_catalog.empty:
@@ -6239,7 +6616,7 @@ def render_comparator_section(
         include_prepost=bool(include_prepost and is_intraday_period),
     )
 
-    st.subheader("Vue d'ensemble")
+    render_section_heading("Vue d'ensemble", "Synthese rapide des prix, variations et sessions de marche.")
     simple_cols = ["Actif", "Region", "Prix", "Variation (%)", "Session"]
     advanced_cols = [
         "Actif", "Region", "Prix", "Variation (%)", "Session", "Source prix",
