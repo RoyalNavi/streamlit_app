@@ -433,15 +433,6 @@ div[data-testid="stCaptionContainer"] {
     padding: 6px 10px;
 }
 
-.app-source-note {
-    background: var(--app-surface);
-    border: 1px solid var(--app-border-soft);
-    border-radius: var(--app-radius);
-    color: var(--app-muted);
-    padding: 14px 16px;
-    min-height: 92px;
-}
-
 @media (max-width: 900px) {
     .app-hero-grid {
         grid-template-columns: 1fr;
