@@ -33,6 +33,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from rafik_dashboard.pages.change import render_change_rates_section
+from rafik_dashboard.ui.components import render_section_heading, render_summary_strip
 from market_universe import (
     europe_equities_frame,
     infer_currency,
@@ -60,7 +62,6 @@ MARKET_CACHE_TTL_SECONDS = 2 * 24 * 60 * 60
 CRYPTO_CACHE_TTL_SECONDS = 12 * 60 * 60
 USER_AGENT = "rafik-streamlit-app/1.0 (finance dashboard)"
 MAX_COMPARISON_COUNT = 10
-CHANGE_DZ_RATES_URL = "https://changedz.fr/rates.json"
 USER_DB_PATH = DATA_DIR / "users.sqlite3"
 JWT_SECRET_PATH = DATA_DIR / "jwt_secret.key"
 BENCHMARK_TICKERS = {
@@ -681,51 +682,6 @@ def inject_global_styles() -> None:
 
 
 inject_global_styles()
-
-
-def render_section_heading(title: str, description: str | None = None) -> None:
-    description_markup = ""
-    if description:
-        description_markup = f"<div class='section-heading-copy'>{escape(description)}</div>"
-    st.html(
-        f"""
-        <div class="section-heading">
-            <h2 class="section-heading-title">{escape(title)}</h2>
-            {description_markup}
-        </div>
-        """
-    )
-
-
-def render_summary_strip(title: str, items: list[dict]) -> None:
-    clean_items = [item for item in items if item.get("value") not in (None, "")]
-    if not clean_items:
-        return
-
-    item_markup = []
-    for item in clean_items[:5]:
-        tone = item.get("tone") or "info"
-        if tone not in {"success", "warning", "danger", "info"}:
-            tone = "info"
-        hint = item.get("hint") or ""
-        item_markup.append(
-            f"""
-            <div class="summary-strip-item {tone}">
-                <div class="summary-strip-label">{escape(str(item.get("label", "")))}</div>
-                <div class="summary-strip-value">{escape(str(item.get("value", "")))}</div>
-                {f'<div class="summary-strip-hint">{escape(str(hint))}</div>' if hint else ''}
-            </div>
-            """
-        )
-
-    st.html(
-        f"""
-        <section class="summary-strip">
-            <div class="summary-strip-title">{escape(title)}</div>
-            <div class="summary-strip-grid">{''.join(item_markup)}</div>
-        </section>
-        """
-    )
 
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -6680,173 +6636,6 @@ def render_briefing_email_schedule(current_user: sqlite3.Row) -> None:
         )
 
 
-def normalize_changedz_rates_payload(payload: object) -> tuple[list[dict], str]:
-    updated_at = ""
-    if isinstance(payload, dict):
-        for key in ("updated_at", "updatedAt", "last_update", "lastUpdate", "date", "timestamp"):
-            if payload.get(key):
-                updated_at = str(payload.get(key))
-                break
-        source = (
-            payload.get("rates")
-            or payload.get("data")
-            or payload.get("currencies")
-            or payload.get("items")
-            or payload
-        )
-    else:
-        source = payload
-
-    rows: list[dict] = []
-    if isinstance(source, dict):
-        metadata_keys = {"updated_at", "updatedAt", "last_update", "lastUpdate", "date", "timestamp"}
-        for key, value in source.items():
-            if key in metadata_keys:
-                continue
-            if isinstance(value, dict):
-                row = dict(value)
-                row.setdefault("Devise", key)
-            else:
-                row = {"Devise": key, "Valeur": value}
-            rows.append(row)
-    elif isinstance(source, list):
-        for index, value in enumerate(source, start=1):
-            if isinstance(value, dict):
-                rows.append(dict(value))
-            else:
-                rows.append({"Devise": f"Ligne {index}", "Valeur": value})
-
-    return rows, updated_at
-
-
-def normalize_changedz_rates_frame(rows: list[dict]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame()
-
-    flattened_rows: list[dict] = []
-    for row in rows:
-        flattened: dict = {}
-        for key, value in row.items():
-            normalized_key = str(key).strip().lower()
-            if isinstance(value, dict):
-                prefix = {"parallel": "Parallele", "official": "Officiel"}.get(normalized_key, str(key))
-                for nested_key, nested_value in value.items():
-                    flattened[f"{prefix} {nested_key}"] = nested_value
-                if normalized_key == "parallel":
-                    if "achat" in value:
-                        flattened["Achat"] = value["achat"]
-                    if "vente" in value:
-                        flattened["Vente"] = value["vente"]
-                    if "change" in value:
-                        flattened["Variation"] = value["change"]
-            else:
-                flattened[key] = value
-        flattened_rows.append(flattened)
-
-    frame = pd.DataFrame(flattened_rows)
-    rename_map = {}
-    canonical_names = {
-        "currency": "Devise",
-        "curr": "Devise",
-        "code": "Devise",
-        "flag": "Drapeau",
-        "symbol": "Devise",
-        "name": "Nom",
-        "label": "Nom",
-        "buy": "Achat",
-        "buy_rate": "Achat",
-        "achat": "Achat",
-        "sell": "Vente",
-        "sell_rate": "Vente",
-        "vente": "Vente",
-        "rate": "Taux",
-        "value": "Valeur",
-        "valeur": "Valeur",
-        "change": "Variation",
-        "variation": "Variation",
-        "updated_at": "Mis a jour",
-        "date": "Date",
-    }
-    for column in frame.columns:
-        normalized = str(column).strip().lower().replace(" ", "_").replace("-", "_")
-        if normalized in canonical_names and canonical_names[normalized] not in frame.columns:
-            rename_map[column] = canonical_names[normalized]
-
-    frame = frame.rename(columns=rename_map)
-    for column in frame.columns:
-        frame[column] = frame[column].map(
-            lambda value: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
-        )
-
-    preferred_order = [
-        "Devise", "Drapeau", "Nom", "Achat", "Vente", "Variation",
-        "Parallele achat", "Parallele vente", "Parallele change",
-        "Officiel achat", "Officiel vente", "Taux", "Valeur", "Mis a jour", "Date",
-    ]
-    preferred = [column for column in preferred_order if column in frame.columns]
-    hidden_raw_columns = {"parallel", "official"}
-    others = [column for column in frame.columns if column not in preferred and str(column).strip().lower() not in hidden_raw_columns]
-    return frame[preferred + others]
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_changedz_rates() -> dict:
-    response = requests.get(
-        CHANGE_DZ_RATES_URL,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-        timeout=15,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    rows, updated_at = normalize_changedz_rates_payload(payload)
-    frame = normalize_changedz_rates_frame(rows)
-    return {"updated_at": updated_at, "frame": frame, "payload": payload}
-
-
-def render_change_rates_section() -> None:
-    render_section_heading(
-        "Change",
-        "Taux de change du dinar recuperes depuis changedz.fr.",
-    )
-
-    refresh_col, source_col = st.columns([1, 3])
-    if refresh_col.button("Rafraichir les taux", key="refresh_changedz_rates", use_container_width=True):
-        fetch_changedz_rates.clear()
-    source_col.caption(f"Source : `{CHANGE_DZ_RATES_URL}`")
-
-    with st.spinner("Je recupere les taux de change..."):
-        try:
-            rates_payload = fetch_changedz_rates()
-        except Exception as exc:
-            st.info(f"Impossible de charger les taux de change pour le moment : {exc}")
-            return
-
-    rates_frame = rates_payload.get("frame")
-    if rates_frame is None or rates_frame.empty:
-        st.info("Aucun taux de change disponible dans la reponse.")
-        return
-
-    updated_at = rates_payload.get("updated_at") or "-"
-    summary_items = [
-        {"label": "Taux disponibles", "value": len(rates_frame), "hint": "lignes chargees", "tone": "info"},
-        {"label": "Derniere MAJ", "value": updated_at, "hint": "fourni par la source", "tone": "info"},
-    ]
-    for _, row in rates_frame.head(3).iterrows():
-        label = str(row.get("Devise") or row.get("Nom") or "Devise")
-        value = row.get("Vente", row.get("Taux", row.get("Valeur", "-")))
-        summary_items.append({"label": label, "value": value, "hint": "prix de vente", "tone": "success"})
-    render_summary_strip("Lecture change", summary_items)
-
-    displayed_frame = rates_frame.copy()
-    if "Devise" in displayed_frame.columns:
-        currency_options = ["Toutes"] + sorted(str(value) for value in displayed_frame["Devise"].dropna().unique())
-        selected_currency = st.selectbox("Filtrer par devise", options=currency_options, key="changedz_currency_filter")
-        if selected_currency != "Toutes":
-            displayed_frame = displayed_frame[displayed_frame["Devise"].astype(str) == selected_currency]
-
-    st.dataframe(displayed_frame, width="stretch", hide_index=True)
-
-
 def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], current_user: sqlite3.Row) -> None:
     general_tab, market_tab = st.tabs(["Infos generales", "News marche"])
 
@@ -7305,7 +7094,7 @@ def main() -> None:
         render_market_today_section(catalog)
 
     elif selected_page == "Change":
-        render_change_rates_section()
+        render_change_rates_section(USER_AGENT)
 
     elif selected_page == "Portefeuille":
         render_portfolio_section(catalog, current_user)
