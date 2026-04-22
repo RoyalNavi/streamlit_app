@@ -6028,11 +6028,10 @@ def render_portfolio_section(catalog: pd.DataFrame, current_user: sqlite3.Row) -
         ],
     )
 
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    render_section_heading("Donnees secondaires", "Details utiles sans repeter la valeur, la performance ou les extremes du portefeuille.")
+    metric_col1, metric_col2 = st.columns(2)
     metric_col1.metric("Capital investi", format_money(total_cost))
-    metric_col2.metric("Valeur actuelle", format_money(total_value))
-    metric_col3.metric("PnL latent", format_money(total_pnl), delta=format_percent(total_return))
-    metric_col4.metric("Lignes suivies", len(portfolio), delta=f"{missing_quotes} sans cotation" if missing_quotes else None)
+    metric_col2.metric("Lignes suivies", len(portfolio), delta=f"{missing_quotes} sans cotation" if missing_quotes else None)
     if missing_quotes:
         st.caption("Les positions sans cotation recente restent visibles, mais elles sont exclues du PnL et de la performance totale.")
 
@@ -6192,7 +6191,6 @@ def render_market_today_section(catalog: pd.DataFrame) -> None:
 
     if not snapshot.empty:
         index_rows = snapshot[snapshot["Groupe"] == "Indices"].copy()
-        other_rows = snapshot[snapshot["Groupe"] != "Indices"].copy()
         index_return = pd.to_numeric(index_rows.get("1j", pd.Series(dtype=float)), errors="coerce")
         avg_index_return = float(index_return.dropna().mean()) if not index_return.dropna().empty else 0.0
         market_sentiment = "Risk-on" if avg_index_return > 0.35 else "Risk-off" if avg_index_return < -0.35 else "Neutre"
@@ -6216,38 +6214,23 @@ def render_market_today_section(catalog: pd.DataFrame) -> None:
             ],
         )
 
-        metric_cols = st.columns(min(4, max(1, len(index_rows))))
-        for col, (_, row) in zip(metric_cols, index_rows.iterrows()):
-            col.metric(row["Actif"], row["Dernier"], delta=format_percent(row["1j"]))
+        international_index_rows = index_rows[~index_rows["Actif"].isin(["S&P 500", "Nasdaq"])].copy()
+        if not international_index_rows.empty:
+            render_section_heading("Indices internationaux", "Repere secondaire sans dupliquer les indices US du bloc principal.")
+            metric_cols = st.columns(min(4, max(1, len(international_index_rows))))
+            for col, (_, row) in zip(metric_cols, international_index_rows.iterrows()):
+                col.metric(row["Actif"], row["Dernier"], delta=format_percent(row["1j"]))
 
-        st.dataframe(
-            snapshot,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Dernier": st.column_config.NumberColumn("Dernier", format="%.2f"),
-                "1j": st.column_config.NumberColumn("1j", format="%.2f%%"),
-                "1m": st.column_config.NumberColumn("1m", format="%.2f%%"),
-            },
-        )
-
-        if not other_rows.empty:
-            fig = go.Figure(
-                go.Bar(
-                    x=other_rows["Actif"],
-                    y=other_rows["1m"].fillna(0),
-                    marker_color=["#15803d" if value >= 0 else "#b91c1c" for value in other_rows["1m"].fillna(0)],
-                    hovertemplate="%{x}<br>Variation 1m : %{y:.2f}%<extra></extra>",
-                )
+            st.dataframe(
+                international_index_rows,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Dernier": st.column_config.NumberColumn("Dernier", format="%.2f"),
+                    "1j": st.column_config.NumberColumn("1j", format="%.2f%%"),
+                    "1m": st.column_config.NumberColumn("1m", format="%.2f%%"),
+                },
             )
-            fig.update_layout(
-                title="Performance 1 mois des actifs de contexte",
-                template="plotly_white",
-                xaxis_title="Actif",
-                yaxis_title="Variation 1 mois (%)",
-                margin=dict(l=30, r=30, t=60, b=30),
-            )
-            st.plotly_chart(fig, width="stretch")
 
     mover_col, news_col = st.columns([1, 1])
     with mover_col:
