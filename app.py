@@ -377,6 +377,76 @@ div[data-testid="stCaptionContainer"] {
     max-width: 920px;
 }
 
+.summary-strip {
+    background: var(--app-surface);
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.045);
+    padding: 14px;
+    margin: 10px 0 18px;
+}
+
+.summary-strip-title {
+    color: var(--app-muted);
+    font-size: 0.78rem;
+    font-weight: 850;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+}
+
+.summary-strip-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+}
+
+.summary-strip-item {
+    background: var(--app-surface-soft);
+    border: 1px solid var(--app-border-soft);
+    border-left: 4px solid var(--app-border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    min-height: 76px;
+}
+
+.summary-strip-item.success {
+    border-left-color: var(--app-green);
+}
+
+.summary-strip-item.warning {
+    border-left-color: var(--app-amber);
+}
+
+.summary-strip-item.danger {
+    border-left-color: var(--app-red);
+}
+
+.summary-strip-item.info {
+    border-left-color: var(--app-blue);
+}
+
+.summary-strip-label {
+    color: var(--app-muted);
+    font-size: 0.78rem;
+    font-weight: 750;
+    margin-bottom: 5px;
+}
+
+.summary-strip-value {
+    color: var(--app-text);
+    font-size: 1.08rem;
+    font-weight: 850;
+    line-height: 1.2;
+}
+
+.summary-strip-hint {
+    color: var(--app-muted);
+    font-size: 0.76rem;
+    line-height: 1.3;
+    margin-top: 5px;
+}
+
 div[data-testid="stMetric"] {
     background: var(--app-surface);
     border: 1px solid var(--app-border-soft);
@@ -533,6 +603,37 @@ def render_section_heading(title: str, description: str | None = None) -> None:
             <h2 class="section-heading-title">{escape(title)}</h2>
             {description_markup}
         </div>
+        """
+    )
+
+
+def render_summary_strip(title: str, items: list[dict]) -> None:
+    clean_items = [item for item in items if item.get("value") not in (None, "")]
+    if not clean_items:
+        return
+
+    item_markup = []
+    for item in clean_items[:5]:
+        tone = item.get("tone") or "info"
+        if tone not in {"success", "warning", "danger", "info"}:
+            tone = "info"
+        hint = item.get("hint") or ""
+        item_markup.append(
+            f"""
+            <div class="summary-strip-item {tone}">
+                <div class="summary-strip-label">{escape(str(item.get("label", "")))}</div>
+                <div class="summary-strip-value">{escape(str(item.get("value", "")))}</div>
+                {f'<div class="summary-strip-hint">{escape(str(hint))}</div>' if hint else ''}
+            </div>
+            """
+        )
+
+    st.html(
+        f"""
+        <section class="summary-strip">
+            <div class="summary-strip-title">{escape(title)}</div>
+            <div class="summary-strip-grid">{''.join(item_markup)}</div>
+        </section>
         """
     )
 
@@ -2856,7 +2957,31 @@ def render_smallcap_opportunities_section() -> None:
 
 
 def render_midcap_recommendations_section() -> None:
+    from cache import read_cache
+
     render_section_heading("Valeurs a fort potentiel", "Signaux classes par moteur, regime de marche et qualite du setup.")
+    stable_cached = read_cache("stock_ideas") or {}
+    stable_meta_cached = read_cache("stock_ideas_meta") or {}
+    smallcap_cached = read_cache("smallcap_ideas") or {}
+    stable_rows = stable_cached.get("data") or []
+    smallcap_rows = smallcap_cached.get("data") or []
+    all_scores = [
+        _as_float(row.get("Score", row.get("score", row.get("Explosion_Score"))))
+        for row in stable_rows + smallcap_rows
+    ]
+    all_scores = [score for score in all_scores if not pd.isna(score)]
+    regime_payload = (stable_meta_cached.get("data") or {}).get("market_regime") or {}
+    regime = regime_payload.get("regime") or "-"
+    confirmed_count = sum(1 for row in stable_rows if _as_bool(row.get("Confirmed", row.get("confirmed"))))
+    render_summary_strip(
+        "Decision rapide",
+        [
+            {"label": "Signaux detectes", "value": len(stable_rows) + len(smallcap_rows), "hint": "stables + small caps", "tone": "info"},
+            {"label": "Meilleur score", "value": f"{max(all_scores):.1f}/10" if all_scores else "-", "hint": "score max disponible", "tone": "success" if all_scores else "warning"},
+            {"label": "Signaux confirmes", "value": confirmed_count, "hint": "validation multi-cycle", "tone": "success" if confirmed_count else "warning"},
+            {"label": "Regime marche", "value": regime, "hint": f"score {regime_payload.get('score', '-')}", "tone": "danger" if regime == "RISK_OFF" else "success" if regime == "RISK_ON" else "warning"},
+        ],
+    )
     stable_tab, smallcap_tab = st.tabs(["Signaux stables", "Small caps explosives"])
     with stable_tab:
         st.caption("Moteur principal : signaux plus propres, confirmes et suivables.")
@@ -5883,6 +6008,25 @@ def render_portfolio_section(catalog: pd.DataFrame, current_user: sqlite3.Row) -
     total_pnl = priced_positions["PnL latent"].sum()
     total_return = (total_pnl / priced_cost * 100) if priced_cost else 0.0
     missing_quotes = portfolio["Dernier cours"].isna().sum()
+    best_position = priced_positions.sort_values("PnL latent (%)", ascending=False).head(1)
+    worst_position = priced_positions.sort_values("PnL latent (%)", ascending=True).head(1)
+    best_label = "-"
+    worst_label = "-"
+    if not best_position.empty:
+        best_row = best_position.iloc[0]
+        best_label = f"{best_row['Ticker']} {best_row['PnL latent (%)']:+.1f}%"
+    if not worst_position.empty:
+        worst_row = worst_position.iloc[0]
+        worst_label = f"{worst_row['Ticker']} {worst_row['PnL latent (%)']:+.1f}%"
+    render_summary_strip(
+        "Decision portefeuille",
+        [
+            {"label": "Valeur totale", "value": format_money(total_value), "hint": "positions cotees", "tone": "info"},
+            {"label": "Performance", "value": format_percent(total_return), "hint": "PnL latent total", "tone": "success" if total_return >= 0 else "danger"},
+            {"label": "Meilleure position", "value": best_label, "hint": "plus forte ligne", "tone": "success"},
+            {"label": "Pire position", "value": worst_label, "hint": "ligne a surveiller", "tone": "danger" if worst_label != "-" else "warning"},
+        ],
+    )
 
     metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
     metric_col1.metric("Capital investi", format_money(total_cost))
@@ -6049,6 +6193,28 @@ def render_market_today_section(catalog: pd.DataFrame) -> None:
     if not snapshot.empty:
         index_rows = snapshot[snapshot["Groupe"] == "Indices"].copy()
         other_rows = snapshot[snapshot["Groupe"] != "Indices"].copy()
+        index_return = pd.to_numeric(index_rows.get("1j", pd.Series(dtype=float)), errors="coerce")
+        avg_index_return = float(index_return.dropna().mean()) if not index_return.dropna().empty else 0.0
+        market_sentiment = "Risk-on" if avg_index_return > 0.35 else "Risk-off" if avg_index_return < -0.35 else "Neutre"
+
+        def market_value(asset_name: str, column: str) -> str:
+            match = snapshot[snapshot["Actif"] == asset_name]
+            if match.empty or column not in match.columns:
+                return "-"
+            value = match.iloc[0][column]
+            if column in {"1j", "1m"}:
+                return format_percent(value)
+            return f"{value:.2f}" if isinstance(value, (int, float)) and not pd.isna(value) else str(value)
+
+        render_summary_strip(
+            "Lecture marche",
+            [
+                {"label": "S&P 500", "value": market_value("S&P 500", "1j"), "hint": "variation 1 jour", "tone": "success" if market_value("S&P 500", "1j").startswith("+") else "danger" if market_value("S&P 500", "1j").startswith("-") else "warning"},
+                {"label": "Nasdaq", "value": market_value("Nasdaq", "1j"), "hint": "variation 1 jour", "tone": "success" if market_value("Nasdaq", "1j").startswith("+") else "danger" if market_value("Nasdaq", "1j").startswith("-") else "warning"},
+                {"label": "Sentiment global", "value": market_sentiment, "hint": "moyenne indices", "tone": "success" if market_sentiment == "Risk-on" else "danger" if market_sentiment == "Risk-off" else "warning"},
+                {"label": "VIX", "value": market_value("VIX", "Dernier"), "hint": "stress marche", "tone": "warning"},
+            ],
+        )
 
         metric_cols = st.columns(min(4, max(1, len(index_rows))))
         for col, (_, row) in zip(metric_cols, index_rows.iterrows()):
@@ -6614,6 +6780,24 @@ def render_comparator_section(
         return_history,
         regular_price_history=regular_price_history,
         include_prepost=bool(include_prepost and is_intraday_period),
+    )
+    leader_label = "-"
+    laggard_label = "-"
+    if not summary_table.empty and "Variation (%)" in summary_table.columns:
+        variations = pd.to_numeric(summary_table["Variation (%)"], errors="coerce")
+        if not variations.dropna().empty:
+            leader = summary_table.loc[variations.idxmax()]
+            laggard = summary_table.loc[variations.idxmin()]
+            leader_label = f"{leader['Ticker']} {leader['Variation (%)']:+.1f}%"
+            laggard_label = f"{laggard['Ticker']} {laggard['Variation (%)']:+.1f}%"
+    render_summary_strip(
+        "Lecture comparaison",
+        [
+            {"label": "Actifs compares", "value": len(comparison_tickers), "hint": "selection active", "tone": "info"},
+            {"label": "Leader", "value": leader_label, "hint": "meilleure performance", "tone": "success"},
+            {"label": "A surveiller", "value": laggard_label, "hint": "plus faible performance", "tone": "danger" if laggard_label != "-" else "warning"},
+            {"label": "Periode", "value": selected_period_label, "hint": f"intervalle {period_config['interval']}", "tone": "info"},
+        ],
     )
 
     render_section_heading("Vue d'ensemble", "Synthese rapide des prix, variations et sessions de marche.")
