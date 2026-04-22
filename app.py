@@ -6720,9 +6720,6 @@ def render_change_rates_section() -> None:
 
     st.dataframe(displayed_frame, width="stretch", hide_index=True)
 
-    with st.expander("Voir la reponse brute"):
-        st.json(rates_payload.get("payload"))
-
 
 def render_news_section(catalog: pd.DataFrame, comparison_tickers: list[str], current_user: sqlite3.Row) -> None:
     general_tab, market_tab = st.tabs(["Infos generales", "News marche"])
