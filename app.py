@@ -319,9 +319,9 @@ div[data-testid="stCaptionContainer"] {
     background: linear-gradient(135deg, #ffffff 0%, #f8fafc 58%, #ecfdf5 100%);
     border: 1px solid var(--app-border);
     border-radius: var(--app-radius);
-    padding: 22px 24px;
+    padding: 24px;
     box-shadow: var(--app-shadow);
-    margin-bottom: 14px;
+    margin-bottom: 12px;
 }
 
 .app-hero-kicker {
@@ -345,8 +345,91 @@ div[data-testid="stCaptionContainer"] {
     color: #334155;
     font-size: 1rem;
     line-height: 1.5;
-    max-width: 780px;
+    max-width: 720px;
     margin-top: 10px;
+}
+
+.app-hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.7fr) minmax(260px, 0.9fr);
+    gap: 18px;
+    align-items: stretch;
+}
+
+.app-market-panel {
+    background: rgba(255, 255, 255, 0.76);
+    border: 1px solid var(--app-border-soft);
+    border-radius: var(--app-radius);
+    padding: 14px;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.045);
+}
+
+.app-market-title {
+    color: var(--app-muted);
+    font-size: 0.76rem;
+    font-weight: 850;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+}
+
+.app-market-status {
+    color: var(--app-text);
+    font-size: 1.18rem;
+    font-weight: 850;
+    line-height: 1.2;
+}
+
+.app-market-reason {
+    color: var(--app-muted);
+    font-size: 0.82rem;
+    line-height: 1.35;
+    margin-top: 6px;
+}
+
+.app-market-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.app-market-chip {
+    background: var(--app-surface-soft);
+    border: 1px solid var(--app-border-soft);
+    border-radius: 8px;
+    padding: 9px 10px;
+}
+
+.app-market-chip-label {
+    color: var(--app-muted);
+    font-size: 0.74rem;
+    font-weight: 750;
+}
+
+.app-market-chip-value {
+    color: var(--app-text);
+    font-size: 0.94rem;
+    font-weight: 850;
+    margin-top: 3px;
+}
+
+.app-system-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    background: transparent;
+    color: var(--app-muted);
+    font-size: 0.8rem;
+    margin: 0 0 14px;
+}
+
+.app-system-pill {
+    background: rgba(255, 255, 255, 0.68);
+    border: 1px solid var(--app-border-soft);
+    border-radius: 999px;
+    padding: 6px 10px;
 }
 
 .app-source-note {
@@ -356,6 +439,12 @@ div[data-testid="stCaptionContainer"] {
     color: var(--app-muted);
     padding: 14px 16px;
     min-height: 92px;
+}
+
+@media (max-width: 900px) {
+    .app-hero-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 .section-heading {
@@ -5754,29 +5843,66 @@ def build_summary_table(
 
 
 def render_header(catalog: pd.DataFrame, cache_path: Path) -> None:
+    market_regime = "Neutre"
+    market_score = "-"
+    market_reason = "Ouvre Marche du jour pour le detail des indices."
+    try:
+        from cache import read_cache
+
+        meta_cache = read_cache("stock_ideas_meta") or {}
+        regime_payload = (meta_cache.get("data") or {}).get("market_regime") or {}
+        raw_regime = str(regime_payload.get("regime") or "").strip()
+        market_score = regime_payload.get("score", "-")
+        if raw_regime == "RISK_ON":
+            market_regime = "Risk-on"
+        elif raw_regime == "RISK_OFF":
+            market_regime = "Risk-off"
+        elif raw_regime:
+            market_regime = raw_regime.replace("_", " ").title()
+        reasons = regime_payload.get("reasons") or []
+        if reasons:
+            market_reason = str(reasons[0])
+    except Exception:
+        pass
+
     st.html(
-        """
+        f"""
         <section class="app-hero">
-            <div class="app-hero-kicker">Dashboard finance</div>
-            <h1 class="app-hero-title">Comparateur Boursier Interactif</h1>
-            <div class="app-hero-copy">
-                Recherche par nom d'entreprise ou d'indice, comparaison multi-actifs,
-                evolution des prix, portefeuille simule, signaux et actualites marche.
+            <div class="app-hero-grid">
+                <div>
+                    <div class="app-hero-kicker">Dashboard finance</div>
+                    <h1 class="app-hero-title">Comparateur Boursier Interactif</h1>
+                    <div class="app-hero-copy">
+                        Compare, suis ton portefeuille et repere rapidement les signaux utiles avant d'agir.
+                    </div>
+                </div>
+                <aside class="app-market-panel">
+                    <div class="app-market-title">Contexte marche</div>
+                    <div class="app-market-status">{escape(market_regime)}</div>
+                    <div class="app-market-reason">{escape(market_reason)}</div>
+                    <div class="app-market-grid">
+                        <div class="app-market-chip">
+                            <div class="app-market-chip-label">Score regime</div>
+                            <div class="app-market-chip-value">{escape(str(market_score))}</div>
+                        </div>
+                        <div class="app-market-chip">
+                            <div class="app-market-chip-label">Indices cles</div>
+                            <div class="app-market-chip-value">S&P 500 / Nasdaq</div>
+                        </div>
+                    </div>
+                </aside>
             </div>
         </section>
         """
     )
 
     last_refresh = time.strftime("%d/%m/%Y %H:%M", time.localtime(cache_path.stat().st_mtime))
-    col1, col2, col3 = st.columns([1, 1, 2])
-    col1.metric("Actifs repertories", f"{len(catalog):,}".replace(",", " "))
-    col2.metric("Derniere mise a jour annuaire", last_refresh)
-    col3.html(
-        """
-        <div class="app-source-note">
-            <strong>Sources</strong><br>
-            Nasdaq Trader pour les societes US, grandes capitalisations europeennes locales,
-            CoinGecko pour les cryptos, Yahoo Finance pour les prix.
+    st.html(
+        f"""
+        <div class="app-system-strip">
+            <span class="app-system-pill">{escape(f"{len(catalog):,}".replace(",", " "))} actifs couverts</span>
+            <span class="app-system-pill">Annuaire mis a jour : {escape(last_refresh)}</span>
+            <span class="app-system-pill">Sources : Nasdaq Trader, Yahoo Finance, CoinGecko, changedz.fr</span>
         </div>
         """
     )
