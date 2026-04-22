@@ -33,6 +33,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from rafik_dashboard.config import load_local_env_file
 from rafik_dashboard.pages.change import render_change_rates_section
 from rafik_dashboard.ui.components import render_section_heading, render_summary_strip
 from rafik_dashboard.ui.styles import inject_global_styles
@@ -235,29 +236,7 @@ NEWS_DIGEST_REUSE_MINUTES = 60
 NEWS_DIGEST_MAIN_SWITCH_MARGIN = 18.0
 
 
-def load_local_env_file(env_path: Path | None = None) -> None:
-    path = env_path or BASE_DIR / ".env"
-    if not path.exists():
-        return
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-
-    for line in lines:
-        cleaned = line.strip()
-        if not cleaned or cleaned.startswith("#") or "=" not in cleaned:
-            continue
-        if cleaned.startswith("export "):
-            cleaned = cleaned[len("export ") :].strip()
-        key, value = cleaned.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("'\"")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-load_local_env_file()
+load_local_env_file(BASE_DIR / ".env")
 
 
 st.set_page_config(page_title="Rafik Moulouel", layout="wide")
