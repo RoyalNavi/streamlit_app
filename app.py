@@ -6023,6 +6023,7 @@ def render_portfolio_section(catalog: pd.DataFrame, current_user: sqlite3.Row) -
         [
             {"label": "Valeur totale", "value": format_money(total_value), "hint": "positions cotees", "tone": "info"},
             {"label": "Performance", "value": format_percent(total_return), "hint": "PnL latent total", "tone": "success" if total_return >= 0 else "danger"},
+            {"label": "PnL absolu", "value": format_money(total_pnl), "hint": "gain ou perte latent", "tone": "success" if total_pnl >= 0 else "danger"},
             {"label": "Meilleure position", "value": best_label, "hint": "plus forte ligne", "tone": "success"},
             {"label": "Pire position", "value": worst_label, "hint": "ligne a surveiller", "tone": "danger" if worst_label != "-" else "warning"},
         ],
