@@ -178,8 +178,8 @@ def init_tracking_db(db_path: Path = SIGNALS_DB_PATH) -> None:
 
 
 def _observation_key(engine: str, ticker: str, detected_at: str, market_timestamp: str | None) -> str:
-    parsed = _parse_iso(market_timestamp) or _parse_iso(detected_at) or datetime.utcnow()
-    # Une observation par moteur/ticker/jour de marche. Cela evite le bruit intraday sans perdre le signal quotidien.
+    parsed = _parse_iso(detected_at) or _parse_iso(market_timestamp) or datetime.utcnow()
+    # Une observation par moteur/ticker/jour de recommandation. Cela garde le suivi lisible cote utilisateur.
     return f"{engine}:{ticker}:{parsed.date().isoformat()}"
 
 
@@ -282,14 +282,14 @@ def register_detected_signals(
 
     with sqlite3.connect(db_path) as conn:
         for payload in payloads:
-            observation_day = str(payload["observation_key"]).rsplit(":", 1)[-1]
+            detected_day = str(payload["detected_at"])[:10]
             tracked_today = conn.execute(
                 """
                 SELECT COUNT(*)
                 FROM tracked_signals
-                WHERE engine = ? AND observation_key LIKE ?
+                WHERE engine = ? AND substr(detected_at, 1, 10) = ?
                 """,
-                (payload["engine"], f"{payload['engine']}:%:{observation_day}"),
+                (payload["engine"], detected_day),
             ).fetchone()[0]
             if max_per_day > 0 and tracked_today >= max_per_day:
                 capped += 1
@@ -405,7 +405,7 @@ def update_signal_outcomes(
                 FROM (
                     SELECT signal_id,
                            ROW_NUMBER() OVER (
-                               PARTITION BY engine, substr(observation_key, -10)
+                               PARTITION BY engine, substr(detected_at, 1, 10)
                                ORDER BY COALESCE(rank, 999999), COALESCE(score, 0) DESC, signal_id
                            ) AS tracking_rank
                     FROM tracked_signals
@@ -486,7 +486,7 @@ def summarize_signal_outcomes(
                 FROM (
                     SELECT signal_id,
                            ROW_NUMBER() OVER (
-                               PARTITION BY engine, substr(observation_key, -10)
+                               PARTITION BY engine, substr(detected_at, 1, 10)
                                ORDER BY COALESCE(rank, 999999), COALESCE(score, 0) DESC, signal_id
                            ) AS tracking_rank
                     FROM tracked_signals
@@ -520,7 +520,7 @@ def summarize_signal_outcomes(
                 FROM (
                     SELECT signal_id,
                            ROW_NUMBER() OVER (
-                               PARTITION BY engine, substr(observation_key, -10)
+                               PARTITION BY engine, substr(detected_at, 1, 10)
                                ORDER BY COALESCE(rank, 999999), COALESCE(score, 0) DESC, signal_id
                            ) AS tracking_rank
                     FROM tracked_signals
