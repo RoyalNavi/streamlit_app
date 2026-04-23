@@ -46,6 +46,7 @@ from signal_tracking import (
     update_signal_outcomes,
 )
 from news_context import enrich_rows_with_news_context
+from market_regime import compute_market_regime, apply_market_regime_adjustment
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -894,9 +895,18 @@ def _fetch_histories(tickers: list[str], period: str = "3mo") -> dict[str, pd.Da
     if not unique_tickers:
         return histories
 
+    european_tickers = [ticker for ticker in unique_tickers if infer_market_region(ticker) == "Europe"]
+    european_ticker_set = set(european_tickers)
+    batched_tickers = [ticker for ticker in unique_tickers if ticker not in european_ticker_set]
+
+    # Les batches yfinance ont deja renvoye des prix dupliques sur certains tickers europeens.
+    # On force donc un fetch individuel pour cette population afin de fiabiliser le prix de reference.
+    for ticker in european_tickers:
+        histories[ticker] = _fetch_history(ticker, period)
+
     chunk_size = 40
-    for start in range(0, len(unique_tickers), chunk_size):
-        chunk = unique_tickers[start:start + chunk_size]
+    for start in range(0, len(batched_tickers), chunk_size):
+        chunk = batched_tickers[start:start + chunk_size]
         try:
             if len(chunk) == 1:
                 histories[chunk[0]] = _fetch_history(chunk[0], period)
@@ -1131,6 +1141,21 @@ def _score_stock(quote: dict, hist: pd.DataFrame, spy_hist: pd.DataFrame, sector
     has_hist = has_hist and len(closes) >= 30
     hist_vol = _to_series(hist["Volume"]) if has_hist and "Volume" in hist.columns else pd.Series(dtype=float)
     last_market_timestamp, last_observed_price = latest_market_observation(hist)
+
+    if last_observed_price is not None:
+        use_history_price = False
+        if pd.isna(price) or price <= 0:
+            use_history_price = True
+        elif market_region == "Europe":
+            use_history_price = True
+        elif price and abs(float(last_observed_price) / float(price) - 1) > 0.2:
+            use_history_price = True
+        if use_history_price:
+            price = float(last_observed_price)
+            if len(closes) >= 2:
+                prev_close = float(closes.iloc[-2])
+                if prev_close > 0:
+                    day_change = (price / prev_close - 1) * 100
 
     if pd.isna(avg_vol) and len(hist_vol) >= 20:
         avg_vol = float(hist_vol.tail(50).mean())
@@ -1564,6 +1589,7 @@ def job_score_stocks() -> None:
     try:
         run_id = uuid.uuid4().hex[:12]
         calculated_at = utc_now_iso()
+        market_regime_payload = compute_market_regime()
         spy_hist = _fetch_history("SPY", "3mo")
         universe_quotes, histories, universe_meta = get_daily_universe(spy_hist)
 
@@ -1608,6 +1634,7 @@ def job_score_stocks() -> None:
                     results[idx]["Earnings"] = "-"
 
         results.sort(key=lambda r: r["Score"], reverse=True)
+        regime_adjustment_stats = apply_market_regime_adjustment(results, "standard", market_regime_payload)
         results = apply_signal_confirmation(results, run_id, calculated_at)
         results.sort(
             key=lambda r: (
@@ -1653,6 +1680,8 @@ def job_score_stocks() -> None:
             "confirm_threshold": SIGNAL_CONFIRM_THRESHOLD,
             "confirm_cycles": SIGNAL_CONFIRM_CYCLES,
             "news_context_enriched": news_context_stats.get("enriched", 0),
+            "market_regime": market_regime_payload,
+            "market_regime_adjustment": regime_adjustment_stats,
         }
         write_cache("stock_ideas", results)
         write_cache("stock_ideas_meta", meta)
@@ -1666,6 +1695,7 @@ def job_score_stocks() -> None:
         top3 = " | ".join(f"{r['Ticker']} ({r['Score']})" for r in results[:3])
         log.info(
             f"job_score_stocks — {len(results)} actions scorees. Top 3 : {top3}. "
+            f"Regime={market_regime_payload.get('regime')}. "
             f"News context={news_context_stats.get('enriched', 0)}. "
             f"Tracking inserted={tracking_stats['inserted']} skipped={tracking_stats['skipped']}"
         )
@@ -1677,14 +1707,32 @@ def job_score_small_caps() -> None:
     log.info("job_score_small_caps — debut")
     try:
         started_at = datetime.now()
+        market_regime_payload = compute_market_regime()
         results = scan_small_cap_opportunities()
         elapsed = (datetime.now() - started_at).total_seconds()
         news_context_stats = enrich_rows_with_news_context(results, engine="smallcap", limit=15)
+        for row in results:
+            news_adjustment = float(row.get("smallcap_news_adjustment") or 0.0)
+            if news_adjustment:
+                row["Explosion_Score"] = round(max(float(row.get("Explosion_Score") or 0.0) + news_adjustment, 0.0), 1)
+        regime_adjustment_stats = apply_market_regime_adjustment(results, "smallcap", market_regime_payload)
+        results.sort(
+            key=lambda row: (
+                float(row.get("Explosion_Score") or 0),
+                float(row.get("rel_volume") or 0),
+                float(row.get("change_pct") or 0),
+            ),
+            reverse=True,
+        )
+        for rank, row in enumerate(results, start=1):
+            row["rank"] = rank
         meta = {
             "duration_seconds": round(elapsed, 1),
             "engine": "smallcap_explosive_momentum",
             "philosophy": "momentum agressif, breakout, volume spike, risque eleve",
             "news_context_enriched": news_context_stats.get("enriched", 0),
+            "market_regime": market_regime_payload,
+            "market_regime_adjustment": regime_adjustment_stats,
         }
         save_smallcap_results(results, meta=meta)
         detected_at = getattr(scan_small_cap_opportunities, "last_meta", {}).get("calculated_at") or utc_now_iso()
@@ -1700,6 +1748,7 @@ def job_score_small_caps() -> None:
         log.info(
             "job_score_small_caps — "
             f"{len(results)} opportunites sauvegardees en {elapsed:.1f}s. Top 3 : {top3 or '-'}. "
+            f"Regime={market_regime_payload.get('regime')}. "
             f"News context={news_context_stats.get('enriched', 0)}. "
             f"Tracking inserted={tracking_stats['inserted']} skipped={tracking_stats['skipped']}"
         )

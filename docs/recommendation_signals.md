@@ -100,6 +100,62 @@ Il est planifie toutes les 7 minutes. Chaque run :
 
 Le job small caps prend en general autour de 25 a 35 secondes, selon la latence Yahoo Finance.
 
+## Regime De Marche Global
+
+Les deux moteurs utilisent un filtre de regime simple calcule dans :
+
+```text
+market_regime.py
+```
+
+Ce module ne remplace pas le scoring technique. Il ajoute seulement un contexte global pour eviter de traiter un breakout small cap de la meme facon dans un marche porteur et dans un marche fragile.
+
+Le regime peut prendre trois valeurs :
+
+- `RISK_ON` : environnement favorable au risque ;
+- `NEUTRAL` : environnement mitigé ;
+- `RISK_OFF` : environnement defensif.
+
+Le calcul utilise principalement :
+
+- SPY et QQQ pour le coeur du marche US ;
+- IWM pour mesurer l'appetit small caps ;
+- prix vs MA50 et MA200 ;
+- pente de la MA50 ;
+- drawdown depuis le plus haut 20 jours ;
+- force relative IWM vs SPY sur environ 20 seances.
+
+Le resultat est ecrit dans les metadonnees des caches :
+
+```text
+data/cache/stock_ideas_meta.json
+data/cache/smallcap_ideas_meta.json
+```
+
+Champs principaux :
+
+- `market_regime.regime` ;
+- `market_regime.score` ;
+- `market_regime.reasons` ;
+- `market_regime.metrics` ;
+- `market_regime_adjustment`.
+
+Impact sur le classement :
+
+| Regime | Moteur standard | Small caps explosives |
+| --- | --- | --- |
+| `RISK_ON` | pas de malus | pas de malus |
+| `NEUTRAL` | leger malus sur breakout | leger malus general |
+| `RISK_OFF` | malus sur breakout | malus plus fort, surtout breakout |
+
+Le filtre reste volontairement simple et parametrable. Il ne reintroduit pas de confirmation multi-cycles dans le scanner small caps et ne change pas la philosophie du moteur standard.
+
+Desactivation possible :
+
+```bash
+MARKET_REGIME_ENABLED=0
+```
+
 ## Construction De L'Univers
 
 La fonction principale est `build_candidate_universe(spy_hist)`.
@@ -1060,6 +1116,62 @@ Valeurs possibles :
 - `Tres eleve`.
 
 Un titre peut rester bien classe meme avec un risque eleve si le mouvement est actif et confirme par le volume. Le scanner n'est donc pas une recommandation prudente : c'est un detecteur de runners potentiels.
+
+### Contexte News Small Caps
+
+Le scanner small caps peut enrichir les meilleurs signaux avec un contexte Yahoo Finance leger, sans appel LLM automatique.
+
+Le code est dans :
+
+```text
+news_context.py
+```
+
+Comportement :
+
+- le worker recupere les dernieres news Yahoo Finance uniquement pour les meilleurs signaux small caps ;
+- les news sont mises en cache dans `data/cache/yahoo_news_context.json` ;
+- l'expiration par defaut est d'environ 45 minutes ;
+- aucun LLM n'est appele par le worker ;
+- une heuristique lit seulement les titres et attribue un label court.
+
+Labels possibles :
+
+- `news_confirmed` : catalyseur clair ou theme sectoriel identifiable ;
+- `no_clear_news` : pas de news claire dans Yahoo ;
+- `earnings` : resultats, guidance ou publication proche ;
+- `offering_risk` : risque de dilution/offering/warrant ;
+- `rumor_possible` : signal potentiellement lie a une rumeur.
+
+Champs ajoutes aux resultats small caps :
+
+- `smallcap_news_label` ;
+- `smallcap_news_display` ;
+- `smallcap_news_headlines` ;
+- `smallcap_news_summary` ;
+- `smallcap_news_adjustment`.
+
+Impact sur le classement :
+
+- `news_confirmed` peut apporter un leger bonus ;
+- `earnings` apporte un petit bonus de contexte ;
+- `offering_risk` applique un malus ;
+- `rumor_possible` applique un petit malus ;
+- `no_clear_news` reste neutre ou legerement negatif.
+
+Desactivation possible :
+
+```bash
+SMALLCAP_NEWS_CONTEXT_ENABLED=0
+```
+
+TTL configurable :
+
+```bash
+YAHOO_NEWS_CONTEXT_TTL_MINUTES=45
+```
+
+Le bouton `Resume IA` dans Streamlit reste separe : il appelle le LLM uniquement quand l'utilisateur clique, puis reutilise `data/cache/news_context_llm.json` si les titres n'ont pas change.
 
 ## Lecture Dans L'UI
 

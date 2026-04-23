@@ -20,6 +20,8 @@ data/crypto_directory.csv
 data/market_directory.csv
 data/watchlist.json
 data/briefings/
+data/archive/
+data/*.backup*
 data/jwt_secret.key
 data/signals.sqlite3
 data/signals.sqlite3-*

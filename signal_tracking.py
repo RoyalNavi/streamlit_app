@@ -15,6 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent
 SIGNALS_DB_PATH = BASE_DIR / "data" / "signals.sqlite3"
 TRACKING_HORIZONS = (1, 3, 5)
 MAX_TRACKED_SIGNALS_PER_ENGINE_DAY = 10
+SIGNAL_LAB_STATUSES = ("A surveiller", "Entre", "Ignore", "Sorti", "Invalide")
 
 log = logging.getLogger("signal_tracking")
 
@@ -58,6 +59,12 @@ def _json_loads(value: str | None, default: Any = None) -> Any:
         return json.loads(value)
     except Exception:
         return default
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _normalize_history_frame(df: pd.DataFrame, ticker: str | None = None) -> pd.DataFrame:
@@ -175,6 +182,35 @@ def init_tracking_db(db_path: Path = SIGNALS_DB_PATH) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tracked_signals_engine_time ON tracked_signals(engine, detected_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tracked_signals_ticker_time ON tracked_signals(ticker, detected_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_complete ON signal_outcomes(followup_complete)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_lab_decisions (
+                decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_key TEXT NOT NULL,
+                engine TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                name TEXT,
+                status TEXT NOT NULL,
+                decision_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source_detected_at TEXT NOT NULL,
+                reference_price REAL,
+                score REAL,
+                setup TEXT,
+                signal_quality TEXT,
+                risk TEXT,
+                source_rank INTEGER,
+                notes TEXT,
+                metadata_json TEXT,
+                UNIQUE(user_key, engine, ticker, source_detected_at)
+            )
+            """
+        )
+        _ensure_column(conn, "signal_lab_decisions", "source_rank", "INTEGER")
+        _ensure_column(conn, "signal_lab_decisions", "notes", "TEXT")
+        _ensure_column(conn, "signal_lab_decisions", "metadata_json", "TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_lab_user_status ON signal_lab_decisions(user_key, status, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_lab_signal ON signal_lab_decisions(engine, ticker, source_detected_at)")
 
 
 def _observation_key(engine: str, ticker: str, detected_at: str, market_timestamp: str | None) -> str:
@@ -493,6 +529,16 @@ def summarize_signal_outcomes(
                     WHERE detected_at >= ?
                 )
                 WHERE tracking_rank <= ?
+            ),
+            suspicious_reference_groups AS (
+                SELECT s.engine,
+                       substr(s.detected_at, 1, 10) AS detected_day,
+                       ROUND(s.reference_price, 4) AS reference_key
+                FROM tracked_signals s
+                JOIN eligible_signals e ON e.signal_id = s.signal_id
+                WHERE s.engine = 'standard'
+                GROUP BY s.engine, detected_day, reference_key
+                HAVING COUNT(DISTINCT s.ticker) >= 4
             )
             SELECT s.engine AS engine,
                    COUNT(*) AS total,
@@ -508,6 +554,11 @@ def summarize_signal_outcomes(
             FROM tracked_signals s
             JOIN signal_outcomes o ON o.signal_id = s.signal_id
             JOIN eligible_signals e ON e.signal_id = s.signal_id
+            LEFT JOIN suspicious_reference_groups g
+              ON g.engine = s.engine
+             AND g.detected_day = substr(s.detected_at, 1, 10)
+             AND g.reference_key = ROUND(s.reference_price, 4)
+            WHERE g.reference_key IS NULL
             GROUP BY s.engine
             ORDER BY s.engine
             """,
@@ -527,6 +578,16 @@ def summarize_signal_outcomes(
                     WHERE detected_at >= ?
                 )
                 WHERE tracking_rank <= ?
+            ),
+            suspicious_reference_groups AS (
+                SELECT s.engine,
+                       substr(s.detected_at, 1, 10) AS detected_day,
+                       ROUND(s.reference_price, 4) AS reference_key
+                FROM tracked_signals s
+                JOIN eligible_signals e ON e.signal_id = s.signal_id
+                WHERE s.engine = 'standard'
+                GROUP BY s.engine, detected_day, reference_key
+                HAVING COUNT(DISTINCT s.ticker) >= 4
             )
             SELECT s.engine, COALESCE(s.setup, '-') AS setup, COUNT(*) AS total,
                    AVG(o.perf_5d_pct) AS avg_5d,
@@ -535,7 +596,12 @@ def summarize_signal_outcomes(
             FROM tracked_signals s
             JOIN signal_outcomes o ON o.signal_id = s.signal_id
             JOIN eligible_signals e ON e.signal_id = s.signal_id
+            LEFT JOIN suspicious_reference_groups g
+              ON g.engine = s.engine
+             AND g.detected_day = substr(s.detected_at, 1, 10)
+             AND g.reference_key = ROUND(s.reference_price, 4)
             WHERE o.perf_5d_pct IS NOT NULL
+              AND g.reference_key IS NULL
             GROUP BY s.engine, s.setup
             HAVING COUNT(*) >= 2
             ORDER BY avg_5d DESC
@@ -543,6 +609,41 @@ def summarize_signal_outcomes(
             """,
             (cutoff, MAX_TRACKED_SIGNALS_PER_ENGINE_DAY),
         ).fetchall()
+        excluded_row = conn.execute(
+            """
+            WITH eligible_signals AS (
+                SELECT signal_id
+                FROM (
+                    SELECT signal_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY engine, substr(detected_at, 1, 10)
+                               ORDER BY COALESCE(rank, 999999), COALESCE(score, 0) DESC, signal_id
+                           ) AS tracking_rank
+                    FROM tracked_signals
+                    WHERE detected_at >= ?
+                )
+                WHERE tracking_rank <= ?
+            ),
+            suspicious_reference_groups AS (
+                SELECT s.engine,
+                       substr(s.detected_at, 1, 10) AS detected_day,
+                       ROUND(s.reference_price, 4) AS reference_key
+                FROM tracked_signals s
+                JOIN eligible_signals e ON e.signal_id = s.signal_id
+                WHERE s.engine = 'standard'
+                GROUP BY s.engine, detected_day, reference_key
+                HAVING COUNT(DISTINCT s.ticker) >= 4
+            )
+            SELECT COUNT(*)
+            FROM tracked_signals s
+            JOIN eligible_signals e ON e.signal_id = s.signal_id
+            JOIN suspicious_reference_groups g
+              ON g.engine = s.engine
+             AND g.detected_day = substr(s.detected_at, 1, 10)
+             AND g.reference_key = ROUND(s.reference_price, 4)
+            """,
+            (cutoff, MAX_TRACKED_SIGNALS_PER_ENGINE_DAY),
+        ).fetchone()
 
     def clean(row: sqlite3.Row) -> dict:
         result = dict(row)
@@ -558,4 +659,179 @@ def summarize_signal_outcomes(
         "since_days": since_days,
         "by_engine": [clean(row) for row in total_rows],
         "top_setups": [clean(row) for row in setup_rows],
+        "excluded_suspicious": int(excluded_row[0]) if excluded_row else 0,
+    }
+
+
+def save_signal_lab_decision(
+    payload: dict,
+    *,
+    user_key: str = "default",
+    status: str = "A surveiller",
+    db_path: Path = SIGNALS_DB_PATH,
+) -> dict[str, Any]:
+    init_tracking_db(db_path)
+    clean_status = status if status in SIGNAL_LAB_STATUSES else "A surveiller"
+    now = utc_now_iso()
+    source_detected_at = str(payload.get("source_detected_at") or payload.get("detected_at") or now)
+    engine = str(payload.get("engine") or "").strip().lower()
+    ticker = str(payload.get("ticker") or "").strip().upper()
+    if not engine or not ticker:
+        raise ValueError("engine and ticker are required")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO signal_lab_decisions (
+                user_key, engine, ticker, name, status, decision_at, updated_at,
+                source_detected_at, reference_price, score, setup, signal_quality,
+                risk, source_rank, notes, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_key, engine, ticker, source_detected_at) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at,
+                reference_price = COALESCE(excluded.reference_price, signal_lab_decisions.reference_price),
+                score = COALESCE(excluded.score, signal_lab_decisions.score),
+                setup = COALESCE(excluded.setup, signal_lab_decisions.setup),
+                signal_quality = COALESCE(excluded.signal_quality, signal_lab_decisions.signal_quality),
+                risk = COALESCE(excluded.risk, signal_lab_decisions.risk),
+                source_rank = COALESCE(excluded.source_rank, signal_lab_decisions.source_rank),
+                metadata_json = excluded.metadata_json
+            """,
+            (
+                user_key,
+                engine,
+                ticker,
+                payload.get("name") or ticker,
+                clean_status,
+                now,
+                now,
+                source_detected_at,
+                _to_float(payload.get("reference_price")),
+                _to_float(payload.get("score")),
+                payload.get("setup"),
+                payload.get("signal_quality"),
+                payload.get("risk"),
+                int(_to_float(payload.get("source_rank"), 0) or 0),
+                payload.get("notes"),
+                _json_dumps(payload.get("metadata") or {}),
+            ),
+        )
+    return {"engine": engine, "ticker": ticker, "status": clean_status}
+
+
+def update_signal_lab_decision_status(
+    decision_id: int,
+    status: str,
+    *,
+    user_key: str = "default",
+    db_path: Path = SIGNALS_DB_PATH,
+) -> bool:
+    init_tracking_db(db_path)
+    if status not in SIGNAL_LAB_STATUSES:
+        raise ValueError(f"Unknown status: {status}")
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            UPDATE signal_lab_decisions
+            SET status = ?, updated_at = ?
+            WHERE decision_id = ? AND user_key = ?
+            """,
+            (status, utc_now_iso(), decision_id, user_key),
+        )
+    return bool(cur.rowcount)
+
+
+def list_signal_lab_decisions(
+    *,
+    user_key: str = "default",
+    db_path: Path = SIGNALS_DB_PATH,
+    since_days: int = 180,
+) -> list[dict[str, Any]]:
+    init_tracking_db(db_path)
+    cutoff = (datetime.utcnow() - timedelta(days=since_days)).replace(microsecond=0).isoformat() + "Z"
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT d.*,
+                   o.perf_1d_pct,
+                   o.perf_3d_pct,
+                   o.perf_5d_pct,
+                   o.max_runup_pct,
+                   o.max_drawdown_pct,
+                   o.followup_complete,
+                   t.signal_id AS tracked_signal_id,
+                   t.detected_at AS tracked_detected_at
+            FROM signal_lab_decisions d
+            LEFT JOIN tracked_signals t
+              ON t.engine = d.engine
+             AND t.ticker = d.ticker
+             AND substr(t.detected_at, 1, 10) = substr(d.source_detected_at, 1, 10)
+            LEFT JOIN signal_outcomes o ON o.signal_id = t.signal_id
+            WHERE d.user_key = ? AND d.decision_at >= ?
+            ORDER BY d.updated_at DESC, d.decision_id DESC
+            """,
+            (user_key, cutoff),
+        ).fetchall()
+
+    results: list[dict[str, Any]] = []
+    seen_decisions: set[int] = set()
+    for row in rows:
+        item = dict(row)
+        decision_id = int(item["decision_id"])
+        if decision_id in seen_decisions:
+            continue
+        seen_decisions.add(decision_id)
+        item["metadata"] = _json_loads(item.pop("metadata_json", None), {})
+        results.append(item)
+    return results
+
+
+def summarize_signal_lab_decisions(
+    *,
+    user_key: str = "default",
+    db_path: Path = SIGNALS_DB_PATH,
+    since_days: int = 180,
+) -> dict[str, Any]:
+    rows = list_signal_lab_decisions(user_key=user_key, db_path=db_path, since_days=since_days)
+    if not rows:
+        return {"total": 0, "by_status": [], "by_engine": []}
+    frame = pd.DataFrame(rows)
+    by_status = (
+        frame.groupby("status", dropna=False)
+        .agg(
+            total=("decision_id", "count"),
+            avg_5d=("perf_5d_pct", "mean"),
+            win_5d=("perf_5d_pct", lambda values: (values.dropna() > 0).mean() * 100 if values.notna().any() else None),
+        )
+        .reset_index()
+    )
+    by_engine = (
+        frame.groupby("engine", dropna=False)
+        .agg(
+            total=("decision_id", "count"),
+            active=("status", lambda values: int(values.isin(["A surveiller", "Entre"]).sum())),
+            avg_5d=("perf_5d_pct", "mean"),
+        )
+        .reset_index()
+    )
+
+    def records(df: pd.DataFrame) -> list[dict[str, Any]]:
+        output = []
+        for item in df.to_dict("records"):
+            for key, value in list(item.items()):
+                if isinstance(value, float) and not pd.isna(value):
+                    item[key] = round(value, 2)
+                elif pd.isna(value):
+                    item[key] = None
+            output.append(item)
+        return output
+
+    return {
+        "total": len(rows),
+        "active": int(frame["status"].isin(["A surveiller", "Entre"]).sum()),
+        "by_status": records(by_status),
+        "by_engine": records(by_engine),
     }

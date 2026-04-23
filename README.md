@@ -1,6 +1,6 @@
 # Streamlit Finance Dashboard
 
-Application Streamlit de suivi de marche, de portefeuille simule, d'analyse d'actions et de briefing d'actualites. Elle combine donnees Yahoo Finance, annuaires Nasdaq/CoinGecko, flux RSS francophones, scoring quantitatif en worker et generation de podcast avec OpenAI.
+Application Streamlit de suivi de marche, de portefeuille simule, d'analyse d'actions, de briefing d'actualites et de statistiques World of Tanks. Elle combine donnees Yahoo Finance, Finnhub, annuaires Nasdaq/CoinGecko, flux RSS francophones, scoring quantitatif en worker et generation de podcast avec OpenAI.
 
 L'application sert surtout a :
 
@@ -10,6 +10,8 @@ L'application sert surtout a :
 - detecter des actions US interessantes via un score technique et momentum ;
 - consulter une fiche entreprise enrichie ;
 - lire des actualites marche et generalistes ;
+- suivre un calendrier macro/evenements de marche ;
+- comparer les stats World of Tanks de joueurs WoT-Life ;
 - generer un script de podcast et un audio MP3 de briefing quotidien ;
 - envoyer automatiquement ce briefing par email.
 
@@ -76,7 +78,14 @@ La page `Analyse` est centree sur les recommandations d'actions :
 
 - `Signaux stables` : recommandations prudentes issues du moteur standard ;
 - `Small caps explosives` : scanner momentum plus speculatif ;
-- `Suivi des signaux` : comparaison objective des performances futures des signaux detectes.
+- `Calendrier` : evenements macro et resultats de grandes capitalisations susceptibles d'impacter les marches ;
+- `Qualite moteur` : lecture des performances historiques des moteurs et des setups ;
+- `Signal Lab` : journal manuel des decisions prises a partir des signaux ;
+- suivi automatique des signaux : comparaison objective des performances futures des signaux detectes.
+
+Les deux moteurs affichent aussi un regime de marche global (`RISK_ON`, `NEUTRAL`, `RISK_OFF`) calcule avec SPY, QQQ et IWM. En regime fragile, le worker applique un malus de classement aux breakouts et surtout aux small caps explosives.
+
+Les small caps peuvent recevoir un contexte news leger sans appel LLM automatique : Yahoo Finance est interroge pour les meilleurs signaux, les titres sont classes par heuristiques (`news_confirmed`, `no_clear_news`, `earnings`, `offering_risk`, `rumor_possible`), puis le resultat est mis en cache. Le bouton `Resume IA` reste manuel et n'appelle le LLM qu'au clic.
 
 Le suivi des signaux affiche notamment :
 
@@ -86,6 +95,41 @@ Le suivi des signaux affiche notamment :
 - run-up moyen ;
 - drawdown moyen ;
 - meilleurs setups recents quand assez de donnees existent.
+
+Le Signal Lab ajoute une couche de decision utilisateur au-dessus du suivi automatique :
+
+- ajout d'un signal courant au journal ;
+- statut manuel : `A surveiller`, `Entre`, `Ignore`, `Sorti`, `Invalide` ;
+- plan de suivi simple selon le moteur, le setup et le risque ;
+- rapprochement avec les performances J+1, J+3 et J+5 quand le signal est aussi suivi par le worker ;
+- statistiques par statut et par moteur.
+
+Le calendrier macro est independant des recommandations. Il utilise Finnhub pour afficher :
+
+- evenements economiques majeurs : Fed/FOMC, taux, inflation, emploi, GDP, PMI/ISM, consommation ;
+- resultats de grandes capitalisations comme Apple, Microsoft, Nvidia, Amazon, Alphabet, Meta, Tesla et banques US ;
+- filtres par horizon, zone, type, importance et nombre maximum d'evenements ;
+- affichage compact par date, avec groupes date/heure/zone/type et detail masquable.
+
+Finnhub est utilise comme couche d'enrichissement. Yahoo Finance reste la source principale du moteur de scoring.
+
+### World Of Tanks
+
+La page `World of Tanks` compare les statistiques WoT-Life de joueurs suivis :
+
+- `Tonald_Drump_` ;
+- `Sasuke_Uchiwa_`.
+
+Elle affiche :
+
+- WN8 et niveau WN8 ;
+- winrate ;
+- nombre de batailles ;
+- tier moyen ;
+- degats moyens ;
+- activite recente 7 jours et 30 jours ;
+- graphe d'evolution WN8 compare ;
+- lien direct vers les profils WoT-Life.
 
 ### Actualites
 
@@ -375,9 +419,11 @@ data/worker.log
 - Grandes valeurs europeennes : liste locale dans `app.py`.
 - Cryptos : CoinGecko pour l'annuaire, Yahoo Finance pour certains prix.
 - Indices, matieres premieres, devises : Yahoo Finance.
+- Calendrier macro et earnings grandes capitalisations : Finnhub si `FINNHUB_API_KEY` est configuree.
 - News marche par actif : Yahoo Finance via `yfinance`.
 - Infos generales : flux RSS publics de medias francophones.
 - Contenu d'articles : extraction HTML via `trafilatura` quand possible.
+- Statistiques World of Tanks : pages publiques WoT-Life.
 - Generation IA : OpenAI Responses API et OpenAI TTS si `OPENAI_API_KEY` est configuree.
 
 ## Installation Locale
@@ -409,6 +455,8 @@ NEWS_EMAIL_TO=destinataire@example.com
 
 OPENAI_API_KEY=sk-...
 OPENAI_SCRIPT_MODEL=gpt-4o-mini
+
+FINNHUB_API_KEY=...
 ```
 
 `.env` doit rester local et ne doit pas etre versionne.
@@ -422,6 +470,13 @@ OPENAI_SCRIPT_MODEL=gpt-4o-mini
 ├── market_universe.py             # Univers Europe, regions et sessions de marche
 ├── cache.py                       # Lecture/ecriture JSON dans data/cache
 ├── requirements.txt
+├── rafik_dashboard/
+│   └── services/
+│       ├── finnhub_client.py
+│       ├── finnhub_earnings.py
+│       ├── finnhub_economic.py
+│       ├── finnhub_news.py
+│       └── wotlife.py
 ├── docs/
 │   ├── recommendation_signals.md
 │   └── news_digest.md

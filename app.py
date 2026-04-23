@@ -27,6 +27,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("rafik_app")
+_finnhub_missing_key_warned = False
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -34,7 +35,11 @@ import requests
 import streamlit as st
 
 from rafik_dashboard.config import load_local_env_file
-from rafik_dashboard.pages.change import render_change_rates_section
+from rafik_dashboard.services.finnhub_client import is_finnhub_configured
+from rafik_dashboard.services.finnhub_economic import get_economic_calendar
+from rafik_dashboard.services.finnhub_earnings import get_earnings_calendar
+from rafik_dashboard.services.finnhub_news import get_company_news
+from rafik_dashboard.services.wotlife import WOTLIFE_PLAYERS, fetch_wotlife_player_stats
 from rafik_dashboard.ui.components import render_section_heading, render_summary_strip
 from rafik_dashboard.ui.styles import inject_global_styles
 from market_universe import (
@@ -83,6 +88,34 @@ MARKET_BRIEFING_ASSETS = [
     {"ticker": "BTC-USD", "name": "Bitcoin", "group": "Crypto"},
     {"ticker": "EURUSD=X", "name": "EUR/USD", "group": "Devises"},
 ]
+GLOBAL_MARKET_MOVING_COMPANIES = [
+    ("AAPL", "Apple"),
+    ("MSFT", "Microsoft"),
+    ("NVDA", "Nvidia"),
+    ("AMZN", "Amazon"),
+    ("GOOGL", "Alphabet"),
+    ("META", "Meta Platforms"),
+    ("TSLA", "Tesla"),
+    ("AVGO", "Broadcom"),
+    ("JPM", "JPMorgan Chase"),
+    ("BAC", "Bank of America"),
+    ("GS", "Goldman Sachs"),
+    ("XOM", "Exxon Mobil"),
+    ("WMT", "Walmart"),
+    ("HD", "Home Depot"),
+    ("UNH", "UnitedHealth"),
+]
+MACRO_HIGH_IMPACT_KEYWORDS = (
+    "fomc", "fed", "federal reserve", "interest rate", "rate decision",
+    "ecb", "european central bank", "boe", "bank of england", "boj", "pboc",
+    "cpi", "inflation", "pce", "ppi", "gdp", "gross domestic product",
+    "unemployment", "non farm", "nonfarm", "payroll", "jobless", "employment",
+    "ism", "pmi", "retail sales", "consumer confidence", "durable goods",
+)
+MACRO_MEDIUM_IMPACT_KEYWORDS = (
+    "housing", "industrial production", "manufacturing", "services",
+    "trade balance", "factory orders", "wages", "sentiment", "confidence",
+)
 PASSWORD_MIN_LENGTH = 12
 PASSWORD_HASH_ITERATIONS = 600_000
 MAX_LOGIN_ATTEMPTS = 5
@@ -1993,6 +2026,12 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
+ENGINE_LABELS = {
+    "standard": "Signaux stables",
+    "smallcap": "Small caps explosives",
+}
+
+
 def _text_list(value) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if item]
@@ -2108,6 +2147,446 @@ def build_recommendation_display_frame(rows: list[dict]) -> pd.DataFrame:
         ["_verdict_rank", "_confirmed_sort", "_opportunity_rank", "_risk_rank", "_score_sort"],
         ascending=[True, True, True, True, False],
     ).reset_index(drop=True)
+
+
+def _parse_finnhub_date(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+
+def _finnhub_symbol(ticker: str) -> str:
+    symbol = str(ticker or "").strip().upper()
+    if not symbol or symbol.startswith("^") or symbol.endswith("=X") or symbol.endswith("-USD"):
+        return ""
+    return symbol
+
+
+def _finnhub_earnings_label(ticker: str, today) -> str:
+    symbol = _finnhub_symbol(ticker)
+    if not symbol:
+        return "N/A"
+
+    horizon = today + timedelta(days=30)
+    rows = get_earnings_calendar(symbol=symbol, from_date=today.isoformat(), to=horizon.isoformat())
+    upcoming_dates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        event_date = _parse_finnhub_date(row.get("date"))
+        if event_date is None:
+            continue
+        days = (event_date.date() - today).days
+        if 0 <= days <= 30:
+            upcoming_dates.append(days)
+    if not upcoming_dates:
+        return "N/A"
+    return f"Earnings +{min(upcoming_dates)} jours"
+
+
+def _finnhub_context_label(ticker: str, today) -> str:
+    symbol = _finnhub_symbol(ticker)
+    if not symbol:
+        return "N/A"
+
+    cutoff = today - timedelta(days=3)
+    rows = get_company_news(symbol, cutoff.isoformat(), today.isoformat())
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        published_at = _parse_finnhub_date(row.get("datetime") or row.get("published_at") or row.get("date"))
+        if published_at and published_at.date() >= cutoff:
+            return "News récente"
+    return "Pas de news"
+
+
+def add_finnhub_enrichment_columns(df: pd.DataFrame) -> pd.DataFrame:
+    global _finnhub_missing_key_warned
+
+    enriched = df.copy()
+    if "Ticker" not in enriched.columns:
+        enriched["Earnings"] = "N/A"
+        enriched["Contexte"] = "N/A"
+        return enriched
+
+    if not is_finnhub_configured():
+        if not _finnhub_missing_key_warned:
+            logger.warning("FINNHUB_API_KEY absente: colonnes Finnhub affichees en N/A.")
+            _finnhub_missing_key_warned = True
+        enriched["Earnings"] = "N/A"
+        enriched["Contexte"] = "N/A"
+        return enriched
+
+    today = datetime.now(timezone.utc).date()
+    enriched["Earnings"] = enriched["Ticker"].map(lambda ticker: _finnhub_earnings_label(ticker, today))
+    enriched["Contexte"] = enriched["Ticker"].map(lambda ticker: _finnhub_context_label(ticker, today))
+    return enriched
+
+
+def _event_risk_label(days_until: int) -> str:
+    if days_until <= 1:
+        return "Tres proche"
+    if days_until <= 3:
+        return "Proche"
+    if days_until <= 7:
+        return "A surveiller"
+    return "Planifie"
+
+
+def _macro_event_importance(event: str, impact: str | None) -> str:
+    text = f"{event} {impact or ''}".lower()
+    if str(impact or "").lower() == "high" or any(keyword in text for keyword in MACRO_HIGH_IMPACT_KEYWORDS):
+        return "Fort"
+    if str(impact or "").lower() == "medium" or any(keyword in text for keyword in MACRO_MEDIUM_IMPACT_KEYWORDS):
+        return "Moyen"
+    return "Faible"
+
+
+def _macro_event_theme(event: str) -> str:
+    text = str(event or "").lower()
+    if any(term in text for term in ("fomc", "fed", "interest rate", "rate decision", "ecb", "boe", "boj", "pboc")):
+        return "Taux / banques centrales"
+    if any(term in text for term in ("cpi", "pce", "ppi", "inflation")):
+        return "Inflation"
+    if any(term in text for term in ("unemployment", "payroll", "jobless", "employment", "non farm", "nonfarm")):
+        return "Emploi"
+    if any(term in text for term in ("gdp", "gross domestic product")):
+        return "Croissance"
+    if any(term in text for term in ("ism", "pmi", "manufacturing", "services")):
+        return "Activite"
+    if any(term in text for term in ("retail sales", "consumer", "confidence", "sentiment")):
+        return "Consommation"
+    return "Macro"
+
+
+def _format_calendar_value(value) -> str:
+    if value in (None, ""):
+        return "-"
+    return str(value)
+
+
+def _format_earnings_time(value) -> str:
+    text = str(value or "").strip().lower()
+    if text == "amc":
+        return "apres cloture"
+    if text == "bmo":
+        return "avant ouverture"
+    if text == "dmh":
+        return "pendant seance"
+    return str(value or "-")
+
+
+def _format_large_calendar_amount(value) -> str | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    abs_value = abs(numeric)
+    if abs_value >= 1_000_000_000:
+        return f"{numeric / 1_000_000_000:.1f} Md"
+    if abs_value >= 1_000_000:
+        return f"{numeric / 1_000_000:.1f} M"
+    return f"{numeric:,.0f}".replace(",", " ")
+
+
+def _calendar_group_title(zone: str, event_type: str) -> str:
+    if event_type == "Earnings grande cap":
+        return f"Resultats grandes caps {zone}"
+    return f"{event_type} {zone}".strip()
+
+
+def _calendar_group_impact(values: pd.Series) -> str:
+    ranks = {"Fort": 0, "Moyen": 1, "Faible": 2}
+    clean_values = [str(value) for value in values.dropna().tolist()]
+    if not clean_values:
+        return "-"
+    return sorted(clean_values, key=lambda value: ranks.get(value, 9))[0]
+
+
+def _calendar_group_risk(values: pd.Series) -> str:
+    ranks = {"Tres proche": 0, "Proche": 1, "A surveiller": 2, "Planifie": 3}
+    clean_values = [str(value) for value in values.dropna().tolist()]
+    if not clean_values:
+        return "-"
+    return sorted(clean_values, key=lambda value: ranks.get(value, 9))[0]
+
+
+def _render_calendar_grouped(events_df: pd.DataFrame) -> None:
+    if events_df.empty:
+        return
+
+    grouped = (
+        events_df
+        .groupby(["Date", "Heure", "Zone", "Type"], dropna=False, sort=False)
+        .agg(
+            Nombre=("Evenement", "count"),
+            Impact=("Importance", _calendar_group_impact),
+            Risque=("Risque", _calendar_group_risk),
+            Evenements=("Evenement", list),
+            Details=("Details", list),
+            Sources=("Source", lambda values: ", ".join(dict.fromkeys(str(value) for value in values if value))),
+        )
+        .reset_index()
+    )
+
+    impact_rank = {"Fort": 0, "Moyen": 1, "Faible": 2}
+    grouped["_impact_rank"] = grouped["Impact"].map(impact_rank).fillna(9)
+    grouped = grouped.sort_values(["Date", "Heure", "_impact_rank", "Type"]).drop(columns=["_impact_rank"])
+
+    agenda_rows: list[dict] = []
+    detail_rows: list[dict] = []
+    for group in grouped.to_dict("records"):
+        title = _calendar_group_title(str(group.get("Zone") or "-"), str(group.get("Type") or "-"))
+        count = int(group.get("Nombre") or 0)
+        events = [str(item) for item in (group.get("Evenements") or []) if item]
+        details = [str(item) for item in (group.get("Details") or []) if item and str(item) != "-"]
+        preview = " | ".join(events[:3])
+        if len(events) > 3:
+            preview += f" | +{len(events) - 3}"
+        agenda_rows.append(
+            {
+                "Date": group.get("Date"),
+                "Heure": group.get("Heure"),
+                "Zone": group.get("Zone"),
+                "Sujet": title,
+                "Impact": group.get("Impact"),
+                "Nb": count,
+                "Apercu": preview,
+            }
+        )
+        detail_rows.append(
+            {
+                "Groupe": f"{group.get('Date')} {group.get('Heure')} · {title}",
+                "Details": "\n".join(f"- {event}" for event in events) + (
+                    "\n" + "\n".join(f"  {detail}" for detail in details[:5]) if details else ""
+                ),
+            }
+        )
+
+    agenda_df = pd.DataFrame(agenda_rows)
+    for date_value, day_df in agenda_df.groupby("Date", sort=False):
+        st.caption(str(date_value))
+        st.dataframe(
+            day_df.drop(columns=["Date"]),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Heure": st.column_config.TextColumn("Heure"),
+                "Zone": st.column_config.TextColumn("Zone"),
+                "Sujet": st.column_config.TextColumn("Sujet"),
+                "Impact": st.column_config.TextColumn("Impact"),
+                "Nb": st.column_config.NumberColumn("Nb", format="%d"),
+                "Apercu": st.column_config.TextColumn("Evenements"),
+            },
+        )
+
+    if detail_rows:
+        with st.expander("Voir le detail des groupes"):
+            selected_group = st.selectbox(
+                "Groupe",
+                options=[row["Groupe"] for row in detail_rows],
+                key="calendar_group_detail",
+            )
+            selected_detail = next((row["Details"] for row in detail_rows if row["Groupe"] == selected_group), "")
+            st.text(selected_detail)
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def build_global_macro_calendar(horizon_days: int) -> pd.DataFrame:
+    today = datetime.now(timezone.utc).date()
+    end_date = today + timedelta(days=horizon_days)
+    rows: list[dict] = []
+
+    for item in get_economic_calendar(today.isoformat(), end_date.isoformat()):
+        if not isinstance(item, dict):
+            continue
+        event_time = _parse_finnhub_date(item.get("time") or item.get("date"))
+        if event_time is None:
+            continue
+        days_until = (event_time.date() - today).days
+        if days_until < 0 or days_until > horizon_days:
+            continue
+        event = str(item.get("event") or "Evenement macro").strip()
+        importance = _macro_event_importance(event, item.get("impact"))
+        if importance == "Faible":
+            continue
+        details = (
+            f"Pays {item.get('country') or '-'} · "
+            f"actuel {_format_calendar_value(item.get('actual'))} · "
+            f"consensus {_format_calendar_value(item.get('estimate'))} · "
+            f"precedent {_format_calendar_value(item.get('prev'))}"
+        )
+        rows.append(
+            {
+                "Date": event_time.date().isoformat(),
+                "Heure": event_time.strftime("%H:%M") if event_time.time() else "-",
+                "Jours": days_until,
+                "Zone": item.get("country") or "-",
+                "Type": _macro_event_theme(event),
+                "Evenement": event,
+                "Importance": importance,
+                "Risque": _event_risk_label(days_until),
+                "Details": details,
+                "Source": "Finnhub macro",
+            }
+        )
+
+    for ticker, name in GLOBAL_MARKET_MOVING_COMPANIES:
+        earnings_rows = get_earnings_calendar(
+            symbol=ticker,
+            from_date=today.isoformat(),
+            to=end_date.isoformat(),
+        )
+        for item in earnings_rows:
+            if not isinstance(item, dict):
+                continue
+            event_date = _parse_finnhub_date(item.get("date"))
+            if event_date is None:
+                continue
+            days_until = (event_date.date() - today).days
+            if days_until < 0 or days_until > horizon_days:
+                continue
+            hour = item.get("hour") or item.get("time") or "-"
+            eps_estimate = item.get("epsEstimate")
+            revenue_estimate = item.get("revenueEstimate")
+            details = []
+            if eps_estimate not in (None, ""):
+                details.append(f"EPS attendu : {float(eps_estimate):.2f}" if _as_float(eps_estimate) is not None else f"EPS attendu : {eps_estimate}")
+            if revenue_estimate not in (None, ""):
+                formatted_revenue = _format_large_calendar_amount(revenue_estimate)
+                details.append(f"CA attendu : {formatted_revenue}" if formatted_revenue else f"CA attendu : {revenue_estimate}")
+            if hour and hour != "-":
+                details.append(_format_earnings_time(hour))
+            rows.append(
+                {
+                    "Date": event_date.date().isoformat(),
+                    "Heure": _format_earnings_time(hour) if hour and hour != "-" else "-",
+                    "Jours": days_until,
+                    "Zone": "US",
+                    "Type": "Earnings grande cap",
+                    "Evenement": f"{name} ({ticker}) - resultats",
+                    "Importance": "Fort",
+                    "Risque": _event_risk_label(days_until),
+                    "Details": " · ".join(details) if details else "-",
+                    "Source": "Finnhub earnings",
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["Date", "Heure", "Jours", "Zone", "Type", "Evenement", "Importance", "Risque", "Details", "Source"])
+    importance_rank = {"Fort": 0, "Moyen": 1, "Faible": 2}
+    frame = pd.DataFrame(rows)
+    frame["_importance_rank"] = frame["Importance"].map(importance_rank).fillna(9)
+    return frame.sort_values(["Jours", "_importance_rank", "Heure", "Evenement"]).drop(columns=["_importance_rank"]).reset_index(drop=True)
+
+
+def render_market_events_calendar_section() -> None:
+    render_section_heading("Calendrier macro", "Evenements economiques et annonces de grandes entreprises susceptibles de bouger les marches.")
+
+    horizon_col, zone_col, type_col, importance_col = st.columns([0.9, 1.0, 1.4, 1.2])
+    horizon_days = horizon_col.selectbox(
+        "Horizon",
+        options=[7, 14, 30, 60],
+        index=1,
+        format_func=lambda value: f"{value} jours",
+        key="event_calendar_horizon",
+    )
+    zone_filter = zone_col.selectbox(
+        "Zone",
+        options=["US", "US + grandes caps", "G7", "Europe", "Tous"],
+        index=0,
+        key="event_calendar_zone_filter",
+    )
+    type_filter = type_col.selectbox(
+        "Type",
+        options=["Majeurs", "Tous", "Macro", "Taux / banques centrales", "Inflation", "Emploi", "Croissance", "Activite", "Consommation", "Earnings grande cap"],
+        index=0,
+        key="event_calendar_type_filter",
+    )
+    importance_filter = importance_col.selectbox(
+        "Importance",
+        options=["Fort + Moyen", "Fort uniquement", "Tous"],
+        index=0,
+        key="event_calendar_importance_filter",
+    )
+
+    if not is_finnhub_configured():
+        st.info("Finnhub n'est pas configure : ajoute FINNHUB_API_KEY dans .env pour charger le calendrier.")
+        return
+
+    with st.spinner("Chargement du calendrier Finnhub..."):
+        events_df = build_global_macro_calendar(int(horizon_days))
+
+    if events_df.empty:
+        st.info("Aucun evenement macro important trouve sur cet horizon.")
+        return
+
+    if zone_filter == "US":
+        events_df = events_df[events_df["Zone"].isin(["US", "USA", "United States"])]
+    elif zone_filter == "US + grandes caps":
+        events_df = events_df[
+            events_df["Zone"].isin(["US", "USA", "United States"])
+            | (events_df["Type"] == "Earnings grande cap")
+        ]
+    elif zone_filter == "G7":
+        events_df = events_df[events_df["Zone"].isin(["US", "USA", "United States", "CA", "JP", "GB", "UK", "DE", "FR", "IT", "EU", "EMU"])]
+    elif zone_filter == "Europe":
+        events_df = events_df[events_df["Zone"].isin(["EU", "EMU", "EZ", "DE", "FR", "IT", "ES", "GB", "UK"])]
+
+    if type_filter == "Majeurs":
+        events_df = events_df[
+            (events_df["Importance"] == "Fort")
+            & events_df["Type"].isin(["Taux / banques centrales", "Inflation", "Emploi", "Croissance", "Activite", "Earnings grande cap"])
+        ]
+    elif type_filter == "Macro":
+        events_df = events_df[events_df["Type"] != "Earnings grande cap"]
+    elif type_filter != "Tous":
+        events_df = events_df[events_df["Type"] == type_filter]
+    if importance_filter == "Fort uniquement":
+        events_df = events_df[events_df["Importance"] == "Fort"]
+    elif importance_filter == "Fort + Moyen":
+        events_df = events_df[events_df["Importance"].isin(["Fort", "Moyen"])]
+
+    if events_df.empty:
+        st.info("Aucun evenement ne correspond a ces filtres.")
+        return
+
+    max_rows = st.slider(
+        "Nombre max d'evenements",
+        min_value=10,
+        max_value=100,
+        value=30,
+        step=10,
+        key="event_calendar_max_rows",
+    )
+    events_df = events_df.head(max_rows)
+
+    near_count = int((events_df["Jours"] <= 3).sum()) if "Jours" in events_df.columns else 0
+    high_count = int((events_df["Importance"] == "Fort").sum()) if "Importance" in events_df.columns else 0
+    render_summary_strip(
+        "Risque macro a venir",
+        [
+            {"label": "Evenements", "value": len(events_df), "hint": f"{horizon_days} prochains jours", "tone": "info"},
+            {"label": "Impact fort", "value": high_count, "hint": "filtre importance", "tone": "danger" if high_count else "success"},
+            {"label": "Tres proches", "value": near_count, "hint": "0 a 3 jours", "tone": "danger" if near_count else "success"},
+            {"label": "Source", "value": "Finnhub", "hint": "macro + earnings", "tone": "info"},
+        ],
+    )
+    _render_calendar_grouped(events_df)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -2312,7 +2791,7 @@ def render_stable_recommendations_section() -> None:
         st.info("Aucune valeur pour cette selection.")
         return
 
-    df = df.head(15).copy()
+    df = add_finnhub_enrichment_columns(df.head(15).copy())
     if "Confirmed" in df.columns:
         df["Confirmed"] = df["Confirmed"].map(lambda value: "Oui" if _as_bool(value) else "Non")
     if "new_observation" in df.columns:
@@ -2328,12 +2807,12 @@ def render_stable_recommendations_section() -> None:
             "Stability_Score", "Consecutive_Hits", "Recent_Top_Hits", "Signal_Age_Minutes",
             "Cours", "Variation (%)", "Capitalisation", "RSI", "MACD",
             "RS_SPY_1m (%)", "RS_SPY_3m (%)", "Distance_MA20 (%)", "Earnings",
-            "context_label", "why_selected", "risk_flags",
+            "Contexte", "context_label", "why_selected", "risk_flags",
         ]
     elif using_cache:
-        show_cols = ["Display_Rank", "Action", "Setup_Type", "Signal", "Opportunité", "Variation (%)", "Risque", "context_label", "Pourquoi", "Verdict"]
+        show_cols = ["Display_Rank", "Action", "Setup_Type", "Signal", "Opportunité", "Variation (%)", "Earnings", "Contexte", "Risque", "context_label", "Pourquoi", "Verdict"]
     else:
-        show_cols = ["Action", "Variation (%)", "Score", "Signal", "Pourquoi"]
+        show_cols = ["Action", "Variation (%)", "Score", "Signal", "Earnings", "Contexte", "Pourquoi"]
 
     display_cols = [c for c in show_cols if c in df.columns]
 
@@ -2362,6 +2841,8 @@ def render_stable_recommendations_section() -> None:
             "market_session": st.column_config.TextColumn("Session"),
             "new_observation": st.column_config.TextColumn("Nouv. obs."),
             "last_market_timestamp": st.column_config.TextColumn("Derniere bougie"),
+            "Earnings": st.column_config.TextColumn("Earnings"),
+            "Contexte": st.column_config.TextColumn("Contexte"),
             "context_label": st.column_config.TextColumn("Contexte news"),
             "why_selected": st.column_config.TextColumn("Pourquoi"),
             "risk_flags": st.column_config.TextColumn("Risques"),
@@ -2563,7 +3044,7 @@ def render_smallcap_opportunities_section() -> None:
         st.caption("Regime marche : " + ", ".join(str(reason) for reason in regime_payload.get("reasons", [])[:6]))
 
 
-def render_midcap_recommendations_section() -> None:
+def render_midcap_recommendations_section(current_user=None) -> None:
     from cache import read_cache
 
     render_section_heading("Valeurs a fort potentiel", "Signaux classes par moteur, regime de marche et qualite du setup.")
@@ -2589,25 +3070,82 @@ def render_midcap_recommendations_section() -> None:
             {"label": "Regime marche", "value": regime, "hint": f"score {regime_payload.get('score', '-')}", "tone": "danger" if regime == "RISK_OFF" else "success" if regime == "RISK_ON" else "warning"},
         ],
     )
-    stable_tab, smallcap_tab = st.tabs(["Signaux stables", "Small caps explosives"])
+    stable_tab, smallcap_tab, calendar_tab, quality_tab, lab_tab = st.tabs(
+        ["Signaux stables", "Small caps explosives", "Calendrier", "Qualite moteur", "Signal Lab"]
+    )
     with stable_tab:
         st.caption("Moteur principal : signaux plus propres, confirmes et suivables.")
         render_stable_recommendations_section()
     with smallcap_tab:
         st.caption("Moteur agressif : momentum court terme, breakout, volume spike et risque eleve.")
         render_smallcap_opportunities_section()
-    st.divider()
-    render_signal_tracking_summary()
+    with calendar_tab:
+        render_market_events_calendar_section()
+    with quality_tab:
+        render_engine_quality_section()
+    with lab_tab:
+        render_signal_lab_section(current_user)
 
 
-def render_signal_tracking_summary() -> None:
+def _quality_verdict(row: pd.Series) -> str:
+    complete = _as_float(row.get("complete"))
+    total = _as_float(row.get("total"))
+    avg_5d = _as_float(row.get("avg_5d"))
+    win_5d = _as_float(row.get("win_5d"))
+    sample_ratio = complete / total if total else 0
+    if complete < 5:
+        return "Echantillon faible"
+    if sample_ratio < 0.5:
+        return "Suivi incomplet"
+    if avg_5d > 1 and win_5d >= 55:
+        return "Robuste"
+    if avg_5d > 0 and win_5d >= 50:
+        return "Correct"
+    if avg_5d < -1 or win_5d < 45:
+        return "A revoir"
+    return "Neutre"
+
+
+def _format_quality_summary(metrics_df: pd.DataFrame) -> list[dict]:
+    if metrics_df.empty:
+        return [
+            {"label": "Signaux", "value": 0, "hint": "periode", "tone": "warning"},
+            {"label": "Complets", "value": 0, "hint": "J+5 disponible", "tone": "warning"},
+            {"label": "Perf J+5", "value": "-", "hint": "moyenne", "tone": "warning"},
+            {"label": "Taux + J+5", "value": "-", "hint": "moyenne", "tone": "warning"},
+        ]
+    total = int(metrics_df["total"].fillna(0).sum()) if "total" in metrics_df.columns else 0
+    complete = int(metrics_df["complete"].fillna(0).sum()) if "complete" in metrics_df.columns else 0
+    avg_5d = metrics_df["avg_5d"].dropna().mean() if "avg_5d" in metrics_df.columns else None
+    win_5d = metrics_df["win_5d"].dropna().mean() if "win_5d" in metrics_df.columns else None
+    return [
+        {"label": "Signaux", "value": total, "hint": "suivis", "tone": "info"},
+        {"label": "Complets", "value": complete, "hint": "J+5 disponible", "tone": "success" if complete else "warning"},
+        {"label": "Perf J+5", "value": f"{avg_5d:+.2f}%" if avg_5d is not None and not pd.isna(avg_5d) else "-", "hint": "moyenne moteurs", "tone": "success" if avg_5d and avg_5d > 0 else "danger"},
+        {"label": "Taux + J+5", "value": f"{win_5d:.1f}%" if win_5d is not None and not pd.isna(win_5d) else "-", "hint": "moyenne moteurs", "tone": "success" if win_5d and win_5d >= 50 else "danger"},
+    ]
+
+
+def render_engine_quality_section() -> None:
     from signal_tracking import summarize_signal_outcomes
 
-    render_section_heading("Suivi des signaux", "Lecture objective des performances futures des recommandations detectees.")
+    render_section_heading("Qualite du moteur", "Mesure des signaux apres detection par moteur, setup et horizon.")
+    period_col, note_col = st.columns([1.1, 3.0])
+    since_days = period_col.selectbox(
+        "Periode",
+        options=[30, 90, 180],
+        index=1,
+        format_func=lambda value: f"{value} jours",
+        key="engine_quality_period",
+    )
+    note_col.caption(
+        "Les statistiques utilisent les signaux enregistres par le worker et leurs performances futures J+1, J+3 et J+5."
+    )
+
     try:
-        summary = summarize_signal_outcomes(since_days=90)
+        summary = summarize_signal_outcomes(since_days=int(since_days))
     except Exception as exc:
-        st.info(f"Suivi indisponible pour le moment : {exc}")
+        st.info(f"Qualite moteur indisponible pour le moment : {exc}")
         return
 
     engine_rows = summary.get("by_engine") or []
@@ -2616,18 +3154,29 @@ def render_signal_tracking_summary() -> None:
         return
 
     metrics_df = pd.DataFrame(engine_rows)
-    label_map = {"standard": "Signaux stables", "smallcap": "Small caps explosives"}
-    metrics_df["Moteur"] = metrics_df["engine"].map(label_map).fillna(metrics_df["engine"])
+    metrics_df["Moteur"] = metrics_df["engine"].map(ENGINE_LABELS).fillna(metrics_df["engine"])
+    metrics_df["Verdict"] = metrics_df.apply(_quality_verdict, axis=1)
+    render_summary_strip("Lecture globale", _format_quality_summary(metrics_df))
+    excluded_suspicious = int(summary.get("excluded_suspicious") or 0)
+    if excluded_suspicious:
+        st.caption(
+            f"{excluded_suspicious} signal(s) de suivi exclus du calcul car un meme prix de reference a ete duplique sur plusieurs tickers."
+        )
+
     display_cols = [
-        "Moteur", "total", "complete", "avg_1d", "avg_3d", "avg_5d",
+        "Moteur", "Verdict", "total", "complete", "avg_1d", "avg_3d", "avg_5d",
         "win_1d", "win_3d", "win_5d", "avg_runup", "avg_drawdown",
     ]
     display_cols = [col for col in display_cols if col in metrics_df.columns]
+
+    st.caption("Performance par moteur")
     st.dataframe(
         metrics_df[display_cols],
         use_container_width=True,
         hide_index=True,
         column_config={
+            "Moteur": st.column_config.TextColumn("Moteur"),
+            "Verdict": st.column_config.TextColumn("Verdict"),
             "total": st.column_config.NumberColumn("Signaux suivis", format="%d"),
             "complete": st.column_config.NumberColumn("Complets", format="%d"),
             "avg_1d": st.column_config.NumberColumn("Perf moy. J+1", format="%+.2f%%"),
@@ -2644,20 +3193,467 @@ def render_signal_tracking_summary() -> None:
     setup_rows = summary.get("top_setups") or []
     if setup_rows:
         setup_df = pd.DataFrame(setup_rows)
-        setup_df["Moteur"] = setup_df["engine"].map(label_map).fillna(setup_df["engine"])
-        st.caption("Meilleurs setups recents avec performance J+5 disponible")
+        setup_df["Moteur"] = setup_df["engine"].map(ENGINE_LABELS).fillna(setup_df["engine"])
+        setup_df["Verdict"] = setup_df.apply(
+            lambda row: "A renforcer" if _as_float(row.get("avg_5d")) > 0 and _as_float(row.get("win_5d")) >= 50 else "A surveiller",
+            axis=1,
+        )
+        st.caption("Meilleurs setups avec performance J+5 disponible")
         st.dataframe(
-            setup_df[["Moteur", "setup", "total", "avg_5d", "win_5d", "avg_runup"]],
+            setup_df[["Moteur", "setup", "Verdict", "total", "avg_5d", "win_5d", "avg_runup"]],
             use_container_width=True,
             hide_index=True,
             column_config={
                 "setup": st.column_config.TextColumn("Setup"),
+                "Verdict": st.column_config.TextColumn("Verdict"),
                 "total": st.column_config.NumberColumn("Signaux", format="%d"),
                 "avg_5d": st.column_config.NumberColumn("Perf moy. J+5", format="%+.2f%%"),
                 "win_5d": st.column_config.NumberColumn("Taux + J+5", format="%.1f%%"),
                 "avg_runup": st.column_config.NumberColumn("Run-up moy.", format="%+.2f%%"),
             },
         )
+    else:
+        st.info("Pas encore assez de signaux complets par setup pour classer les configurations.")
+
+
+def render_signal_tracking_summary() -> None:
+    render_engine_quality_section()
+
+
+def _signal_lab_user_key(current_user) -> str:
+    if isinstance(current_user, sqlite3.Row):
+        return str(current_user["username"])
+    if isinstance(current_user, dict):
+        return str(current_user.get("username") or "default")
+    return "default"
+
+
+def _signal_lab_status_tone(status: str) -> str:
+    if status in {"Entre", "Sorti"}:
+        return "success"
+    if status == "Invalide":
+        return "danger"
+    if status == "Ignore":
+        return "warning"
+    return "info"
+
+
+def _signal_lab_plan(payload: dict) -> str:
+    engine = payload.get("engine")
+    risk = str(payload.get("risk") or "").lower()
+    setup = str(payload.get("setup") or "").lower()
+    score = _as_float(payload.get("score"))
+    if engine == "smallcap":
+        if "eleve" in risk or "high" in risk or score >= 8:
+            return "Momentum agressif : suivre uniquement si volume reste fort; invalidation si le mouvement se retourne vite."
+        return "Small cap active : surveiller volume relatif, tenue du plus haut de seance et absence de mauvaise news."
+    if "breakout" in setup:
+        return "Breakout : validation si le prix tient la cassure; invalidation si retour sous la zone de rupture."
+    if "pullback" in setup:
+        return "Pullback : validation si reprise sur MA20/MA50; invalidation si la respiration devient une cassure."
+    if "eleve" in risk or "élevé" in risk:
+        return "Signal tendu : attendre confirmation ou repli; invalidation si drawdown rapide ou news adverse."
+    return "Signal stable : suivre J+1/J+3/J+5, avec invalidation si momentum et force relative se degradent."
+
+
+def _standard_signal_lab_payload(row: dict, source_detected_at: str) -> dict:
+    risk_flags = row.get("risk_flags")
+    risk = ", ".join(risk_flags) if isinstance(risk_flags, list) else risk_flags
+    return {
+        "engine": "standard",
+        "ticker": str(row.get("Ticker") or "").upper(),
+        "name": row.get("Nom") or row.get("Ticker"),
+        "source_detected_at": row.get("last_market_timestamp") or source_detected_at,
+        "reference_price": row.get("last_observed_price") or row.get("Cours"),
+        "score": row.get("Score"),
+        "setup": row.get("Setup_Type") or row.get("Setup"),
+        "signal_quality": "confirmed" if _as_bool(row.get("Confirmed")) else recommendation_signal_label(pd.Series(row)),
+        "risk": risk or recommendation_risk_label(pd.Series(row)),
+        "source_rank": row.get("Display_Rank") or row.get("Rank_Global"),
+        "metadata": {
+            "why": row.get("why_selected") or row.get("Signaux"),
+            "verdict": recommendation_verdict(pd.Series(row)),
+            "market_regime": row.get("market_regime"),
+            "context_label": row.get("context_label"),
+            "last_market_timestamp": row.get("last_market_timestamp"),
+        },
+    }
+
+
+def _smallcap_signal_lab_payload(row: dict, source_detected_at: str) -> dict:
+    return {
+        "engine": "smallcap",
+        "ticker": str(row.get("ticker") or "").upper(),
+        "name": row.get("name") or row.get("ticker"),
+        "source_detected_at": row.get("last_market_timestamp") or source_detected_at,
+        "reference_price": row.get("last_observed_price") or row.get("price"),
+        "score": row.get("Explosion_Score"),
+        "setup": row.get("setup"),
+        "signal_quality": row.get("signal_quality"),
+        "risk": row.get("risk"),
+        "source_rank": row.get("rank"),
+        "metadata": {
+            "tags": row.get("tags"),
+            "comment": row.get("comment"),
+            "market_regime": row.get("market_regime"),
+            "context_label": row.get("context_label") or row.get("smallcap_news_display"),
+            "rel_volume": row.get("rel_volume"),
+            "change_pct": row.get("change_pct"),
+        },
+    }
+
+
+def load_signal_lab_candidates(limit: int = 25) -> list[dict]:
+    from cache import read_cache
+
+    candidates: list[dict] = []
+    stable_cached = read_cache("stock_ideas") or {}
+    stable_updated = stable_cached.get("updated_at") or datetime.now().isoformat()
+    stable_rows = stable_cached.get("data") or []
+    for row in stable_rows[:limit]:
+        payload = _standard_signal_lab_payload(row, stable_updated)
+        if payload.get("ticker"):
+            candidates.append(payload)
+
+    smallcap_cached = read_cache("smallcap_ideas") or {}
+    smallcap_updated = smallcap_cached.get("updated_at") or datetime.now().isoformat()
+    smallcap_rows = smallcap_cached.get("data") or []
+    for row in smallcap_rows[:limit]:
+        payload = _smallcap_signal_lab_payload(row, smallcap_updated)
+        if payload.get("ticker"):
+            candidates.append(payload)
+
+    candidates.sort(
+        key=lambda item: (
+            0 if item.get("engine") == "standard" else 1,
+            int(_as_float(item.get("source_rank"), 999_999) or 999_999),
+            -_as_float(item.get("score")),
+        )
+    )
+    return candidates[:limit]
+
+
+def render_signal_lab_section(current_user=None) -> None:
+    from signal_tracking import (
+        SIGNAL_LAB_STATUSES,
+        list_signal_lab_decisions,
+        save_signal_lab_decision,
+        summarize_signal_lab_decisions,
+        update_signal_lab_decision_status,
+    )
+
+    render_section_heading("Signal Lab", "Journal de decision pour relier les signaux, les choix et les performances futures.")
+    user_key = _signal_lab_user_key(current_user)
+    candidates = load_signal_lab_candidates(limit=30)
+
+    summary = summarize_signal_lab_decisions(user_key=user_key, since_days=180)
+    by_status = {row.get("status"): row for row in summary.get("by_status", [])}
+    render_summary_strip(
+        "Journal actif",
+        [
+            {"label": "Decisions", "value": summary.get("total", 0), "hint": "180 derniers jours", "tone": "info"},
+            {"label": "Actives", "value": summary.get("active", 0), "hint": "a surveiller + entre", "tone": "success" if summary.get("active") else "warning"},
+            {"label": "Entre", "value": by_status.get("Entre", {}).get("total", 0), "hint": "statut manuel", "tone": "success"},
+            {"label": "Invalides", "value": by_status.get("Invalide", {}).get("total", 0), "hint": "signaux ecartes", "tone": "danger" if by_status.get("Invalide", {}).get("total") else "info"},
+        ],
+    )
+
+    if candidates:
+        labels = [
+            f"{ENGINE_LABELS.get(item['engine'], item['engine'])} · {item['ticker']} · "
+            f"{_as_float(item.get('score')):.1f}/10 · {item.get('setup') or '-'}"
+            for item in candidates
+        ]
+        choice_col, status_col, action_col = st.columns([2.8, 1.2, 1.2])
+        selected_label = choice_col.selectbox("Signal", labels, key="signal_lab_candidate")
+        selected = candidates[labels.index(selected_label)]
+        selected_status = status_col.selectbox(
+            "Statut",
+            list(SIGNAL_LAB_STATUSES),
+            index=0,
+            key="signal_lab_new_status",
+        )
+        action_col.write("")
+        action_col.write("")
+        if action_col.button("Ajouter", key="signal_lab_add", use_container_width=True):
+            save_signal_lab_decision(selected, user_key=user_key, status=selected_status)
+            st.success(f"{selected['ticker']} ajoute au journal.")
+            st.rerun()
+
+        detail_col, plan_col = st.columns([1.4, 2.2])
+        detail_col.metric("Score", f"{_as_float(selected.get('score')):.1f}/10")
+        detail_col.caption(
+            f"{ENGINE_LABELS.get(selected.get('engine'), selected.get('engine'))} · "
+            f"{selected.get('signal_quality') or '-'} · risque {selected.get('risk') or '-'}"
+        )
+        plan_col.info(_signal_lab_plan(selected))
+    else:
+        st.info("Aucun signal courant disponible dans les caches du worker.")
+
+    decisions = list_signal_lab_decisions(user_key=user_key, since_days=180)
+    if not decisions:
+        st.info("Le journal est encore vide. Ajoute un signal courant pour commencer la boucle decision -> suivi.")
+        return
+
+    df = pd.DataFrame(decisions)
+    df["Moteur"] = df["engine"].map(ENGINE_LABELS).fillna(df["engine"])
+    df["Signal"] = df.apply(lambda row: f"{row.get('name') or row.get('ticker')} ({row.get('ticker')})", axis=1)
+    df["Plan"] = df.apply(lambda row: _signal_lab_plan(row.to_dict()), axis=1)
+    df["Perf J+1"] = df["perf_1d_pct"]
+    df["Perf J+3"] = df["perf_3d_pct"]
+    df["Perf J+5"] = df["perf_5d_pct"]
+    df["Run-up"] = df["max_runup_pct"]
+    df["Drawdown"] = df["max_drawdown_pct"]
+
+    status_options = ["Tous"] + list(SIGNAL_LAB_STATUSES)
+    filter_col, edit_col, new_status_col, save_col = st.columns([1.2, 2.2, 1.2, 1.0])
+    status_filter = filter_col.selectbox("Filtrer", status_options, key="signal_lab_status_filter")
+    visible_df = df if status_filter == "Tous" else df[df["status"] == status_filter]
+
+    editable_labels = [
+        f"#{int(row.decision_id)} · {row.ticker} · {row.status} · {ENGINE_LABELS.get(row.engine, row.engine)}"
+        for row in visible_df.itertuples()
+    ]
+    if editable_labels:
+        selected_decision_label = edit_col.selectbox("Decision", editable_labels, key="signal_lab_existing_decision")
+        selected_decision_id = int(selected_decision_label.split(" · ", 1)[0].replace("#", ""))
+        current_status = str(df.loc[df["decision_id"] == selected_decision_id, "status"].iloc[0])
+        new_status = new_status_col.selectbox(
+            "Nouveau statut",
+            list(SIGNAL_LAB_STATUSES),
+            index=list(SIGNAL_LAB_STATUSES).index(current_status) if current_status in SIGNAL_LAB_STATUSES else 0,
+            key="signal_lab_update_status",
+        )
+        save_col.write("")
+        save_col.write("")
+        if save_col.button("Mettre a jour", key="signal_lab_update", use_container_width=True):
+            update_signal_lab_decision_status(selected_decision_id, new_status, user_key=user_key)
+            st.success("Statut mis a jour.")
+            st.rerun()
+
+    display_cols = [
+        "status", "Moteur", "Signal", "source_detected_at", "reference_price",
+        "score", "setup", "signal_quality", "risk", "Perf J+1", "Perf J+3",
+        "Perf J+5", "Run-up", "Drawdown", "Plan",
+    ]
+    display_cols = [col for col in display_cols if col in visible_df.columns]
+    st.dataframe(
+        visible_df[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "status": st.column_config.TextColumn("Statut"),
+            "Moteur": st.column_config.TextColumn("Moteur"),
+            "Signal": st.column_config.TextColumn("Signal"),
+            "source_detected_at": st.column_config.TextColumn("Signal detecte"),
+            "reference_price": st.column_config.NumberColumn("Prix signal", format="%.2f"),
+            "score": st.column_config.ProgressColumn("Score", min_value=0, max_value=10, format="%.1f"),
+            "setup": st.column_config.TextColumn("Setup"),
+            "signal_quality": st.column_config.TextColumn("Qualite"),
+            "risk": st.column_config.TextColumn("Risque"),
+            "Perf J+1": st.column_config.NumberColumn("Perf J+1", format="%+.2f%%"),
+            "Perf J+3": st.column_config.NumberColumn("Perf J+3", format="%+.2f%%"),
+            "Perf J+5": st.column_config.NumberColumn("Perf J+5", format="%+.2f%%"),
+            "Run-up": st.column_config.NumberColumn("Run-up", format="%+.2f%%"),
+            "Drawdown": st.column_config.NumberColumn("Drawdown", format="%+.2f%%"),
+            "Plan": st.column_config.TextColumn("Plan"),
+        },
+    )
+
+    status_rows = summary.get("by_status") or []
+    engine_rows = summary.get("by_engine") or []
+    if status_rows or engine_rows:
+        left, right = st.columns(2)
+        if status_rows:
+            status_df = pd.DataFrame(status_rows)
+            left.caption("Qualite par statut")
+            left.dataframe(
+                status_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "status": st.column_config.TextColumn("Statut"),
+                    "total": st.column_config.NumberColumn("Total", format="%d"),
+                    "avg_5d": st.column_config.NumberColumn("Perf moy. J+5", format="%+.2f%%"),
+                    "win_5d": st.column_config.NumberColumn("Taux + J+5", format="%.1f%%"),
+                },
+            )
+        if engine_rows:
+            engine_df = pd.DataFrame(engine_rows)
+            engine_df["engine"] = engine_df["engine"].map(ENGINE_LABELS).fillna(engine_df["engine"])
+            right.caption("Qualite par moteur")
+            right.dataframe(
+                engine_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "engine": st.column_config.TextColumn("Moteur"),
+                    "total": st.column_config.NumberColumn("Total", format="%d"),
+                    "active": st.column_config.NumberColumn("Actifs", format="%d"),
+                    "avg_5d": st.column_config.NumberColumn("Perf moy. J+5", format="%+.2f%%"),
+                },
+            )
+
+
+def _format_wot_number(value, decimals: int = 0, suffix: str = "") -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if pd.isna(numeric):
+        return "-"
+    if decimals <= 0:
+        return f"{numeric:,.0f}{suffix}".replace(",", " ")
+    return f"{numeric:,.{decimals}f}{suffix}".replace(",", " ")
+
+
+def render_wot_stats_section() -> None:
+    render_section_heading("World of Tanks", "Comparaison WoT-Life des joueurs suivis sur le serveur NA.")
+
+    refresh_col, source_col = st.columns([1, 3])
+    if refresh_col.button("Rafraichir WoT", key="refresh_wotlife_stats", use_container_width=True):
+        fetch_wotlife_player_stats.clear()
+    source_col.caption("Source : WoT-Life NA · cache 1h")
+
+    player_payloads = []
+    errors = []
+    for player_name, url in WOTLIFE_PLAYERS.items():
+        try:
+            player_payloads.append(fetch_wotlife_player_stats(url, player_name))
+        except Exception as exc:
+            errors.append(f"{player_name}: {exc}")
+    if errors:
+        st.info("Certains profils WoT-Life sont indisponibles : " + " | ".join(errors))
+    if not player_payloads:
+        st.markdown("[Ouvrir WoT-Life](https://en.wot-life.com/)")
+        return
+
+    comparison_df = pd.DataFrame(
+        [
+            {
+                "Joueur": payload.get("player"),
+                "WN8": payload.get("wn8"),
+                "Niveau WN8": payload.get("wn8_label"),
+                "Winrate": payload.get("winrate"),
+                "Batailles": payload.get("battles"),
+                "Tier moyen": payload.get("avg_tier"),
+                "Degats moyens": payload.get("damage_dealt"),
+                "Batailles 7j": payload.get("recent_7d_battles"),
+                "Winrate 7j": payload.get("recent_7d_winrate"),
+                "Batailles 30j": payload.get("recent_30d_battles"),
+                "Winrate 30j": payload.get("recent_30d_winrate"),
+                "Source": payload.get("url"),
+            }
+            for payload in player_payloads
+        ]
+    )
+    best_wn8 = comparison_df["WN8"].dropna().max() if "WN8" in comparison_df else None
+    best_winrate = comparison_df["Winrate"].dropna().max() if "Winrate" in comparison_df else None
+    most_active = comparison_df["Batailles 30j"].map(lambda value: _as_float(str(value).replace(" ", ""))).dropna().max() if "Batailles 30j" in comparison_df else None
+    render_summary_strip(
+        "Duel WN8",
+        [
+            {"label": "Meilleur WN8", "value": _format_wot_number(best_wn8, 1), "hint": "total", "tone": "success"},
+            {"label": "Meilleur WR", "value": _format_wot_number(best_winrate, 2, "%"), "hint": "total", "tone": "success"},
+            {"label": "Activite 30j", "value": _format_wot_number(most_active), "hint": "max batailles", "tone": "info"},
+            {"label": "Joueurs", "value": len(player_payloads), "hint": "profils suivis", "tone": "info"},
+        ],
+    )
+
+    st.dataframe(
+        comparison_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Joueur": st.column_config.TextColumn("Joueur"),
+            "WN8": st.column_config.NumberColumn("WN8", format="%.1f"),
+            "Niveau WN8": st.column_config.TextColumn("Niveau WN8"),
+            "Winrate": st.column_config.NumberColumn("Winrate", format="%.2f%%"),
+            "Batailles": st.column_config.NumberColumn("Batailles", format="%d"),
+            "Tier moyen": st.column_config.NumberColumn("Tier moyen", format="%.2f"),
+            "Degats moyens": st.column_config.NumberColumn("Degats moyens", format="%.0f"),
+            "Batailles 7j": st.column_config.TextColumn("Batailles 7j"),
+            "Winrate 7j": st.column_config.TextColumn("Winrate 7j"),
+            "Batailles 30j": st.column_config.TextColumn("Batailles 30j"),
+            "Winrate 30j": st.column_config.TextColumn("Winrate 30j"),
+            "Source": st.column_config.LinkColumn("WoT-Life"),
+        },
+    )
+
+    figure = go.Figure()
+    for payload in player_payloads:
+        history = payload.get("history")
+        if isinstance(history, pd.DataFrame) and not history.empty:
+            figure.add_trace(
+                go.Scatter(
+                    x=history["date"],
+                    y=history["wn8"],
+                    mode="lines+markers",
+                    name=str(payload.get("player")),
+                    hovertemplate="%{x|%d/%m/%Y}<br>WN8: %{y:.1f}<extra></extra>",
+                )
+            )
+    if figure.data:
+        figure.update_layout(
+            title="Evolution WN8 comparee",
+            height=360,
+            margin=dict(l=20, r=20, t=45, b=20),
+            yaxis_title="WN8",
+            xaxis_title="",
+            legend_title="Joueur",
+        )
+        st.plotly_chart(figure, width="stretch")
+    else:
+        st.info("Historique WN8 indisponible pour les profils charges.")
+
+    player_tabs = st.tabs([str(payload.get("player") or "Joueur") for payload in player_payloads])
+    for tab, payload in zip(player_tabs, player_payloads):
+        with tab:
+            history = payload.get("history")
+            render_summary_strip(
+                f"Profil {payload.get('player')}",
+                [
+                    {"label": "WN8", "value": _format_wot_number(payload.get("wn8"), 1), "hint": payload.get("wn8_label") or "-", "tone": "success" if payload.get("wn8") and payload.get("wn8") >= 1900 else "warning"},
+                    {"label": "Winrate", "value": _format_wot_number(payload.get("winrate"), 2, "%"), "hint": "total", "tone": "success" if payload.get("winrate") and payload.get("winrate") >= 55 else "warning"},
+                    {"label": "Batailles", "value": _format_wot_number(payload.get("battles")), "hint": "total", "tone": "info"},
+                    {"label": "Degats moy.", "value": _format_wot_number(payload.get("damage_dealt"), 0), "hint": f"tier moy. {_format_wot_number(payload.get('avg_tier'), 2)}", "tone": "info"},
+                ],
+            )
+
+            recent_df = pd.DataFrame(
+                [
+                    {"Periode": "7 jours", "Batailles": payload.get("recent_7d_battles"), "Winrate": payload.get("recent_7d_winrate")},
+                    {"Periode": "30 jours", "Batailles": payload.get("recent_30d_battles"), "Winrate": payload.get("recent_30d_winrate")},
+                ]
+            )
+            st.dataframe(
+                recent_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Periode": st.column_config.TextColumn("Periode"),
+                    "Batailles": st.column_config.TextColumn("Batailles"),
+                    "Winrate": st.column_config.TextColumn("Winrate"),
+                },
+            )
+
+            if isinstance(history, pd.DataFrame) and not history.empty:
+                latest_rows = history.tail(8).copy()
+                latest_rows["Date"] = latest_rows["date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(
+                    latest_rows[["Date", "wn8", "winrate", "battles"]].rename(
+                        columns={"wn8": "WN8", "winrate": "Winrate", "battles": "Batailles"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Date": st.column_config.TextColumn("Date"),
+                        "WN8": st.column_config.NumberColumn("WN8", format="%.1f"),
+                        "Winrate": st.column_config.NumberColumn("Winrate", format="%.2f%%"),
+                        "Batailles": st.column_config.NumberColumn("Batailles", format="%d"),
+                    },
+                )
+            st.markdown(f"[Ouvrir le profil WoT-Life]({payload.get('url')})")
 
 
 def render_market_movers_section(catalog: pd.DataFrame) -> None:
@@ -5419,7 +6415,7 @@ def render_header(catalog: pd.DataFrame, cache_path: Path) -> None:
         <div class="app-system-strip">
             <span class="app-system-pill">{escape(f"{len(catalog):,}".replace(",", " "))} actifs couverts</span>
             <span class="app-system-pill">Annuaire mis a jour : {escape(last_refresh)}</span>
-            <span class="app-system-pill">Sources : Nasdaq Trader, Yahoo Finance, CoinGecko, changedz.fr</span>
+            <span class="app-system-pill">Sources : Nasdaq Trader, Yahoo Finance, CoinGecko</span>
         </div>
         """
     )
@@ -6629,7 +7625,7 @@ def main() -> None:
 
     catalog = load_symbol_catalog(max(cache_path.stat().st_mtime, crypto_cache_path.stat().st_mtime))
     render_header(catalog, cache_path)
-    page_names = ["Comparateur", "Portefeuille", "Marche du jour", "Change", "Analyse", "Actualites"]
+    page_names = ["Comparateur", "Portefeuille", "Marche du jour", "Analyse", "World of Tanks", "Actualites"]
     if st.session_state.get("main_page") not in page_names:
         st.session_state["main_page"] = page_names[0]
     selected_page = st.radio(
@@ -6654,14 +7650,14 @@ def main() -> None:
     elif selected_page == "Marche du jour":
         render_market_today_section(catalog)
 
-    elif selected_page == "Change":
-        render_change_rates_section(USER_AGENT)
-
     elif selected_page == "Portefeuille":
         render_portfolio_section(catalog, current_user)
 
     elif selected_page == "Analyse":
-        render_midcap_recommendations_section()
+        render_midcap_recommendations_section(current_user)
+
+    elif selected_page == "World of Tanks":
+        render_wot_stats_section()
 
     elif selected_page == "Actualites":
         render_news_section(catalog, comparison_tickers, current_user)
